@@ -1,0 +1,285 @@
+# app/camera_handler.py
+import cv2
+import threading
+import time
+import platform
+import queue
+from glob import glob
+from typing import Dict, Optional, List, Any, Set  # ✨ เพิ่ม Set
+from dataclasses import dataclass, field
+
+from .ai_engine import annotate_and_match
+
+
+def _backend_flag():
+    if platform.system() == "Windows":
+        return cv2.CAP_DSHOW
+    return 0
+
+
+@dataclass
+class CameraSource:
+    cam_id: str
+    src: str
+    is_open: bool = False
+    cap: Optional[cv2.VideoCapture] = None
+    last_frame: Optional[bytes] = None  # สำหรับ MJPEG (ภาพดิบ)
+    _thread: Optional[threading.Thread] = field(default=None, repr=False)
+    _stop: bool = field(default=False, repr=False)
+
+    ai_queue: queue.Queue = field(default_factory=queue.Queue, repr=False)
+    _ai_thread: Optional[threading.Thread] = field(default=None, repr=False)
+
+    # ✨ ตัวแปรสำหรับเก็บผลลัพธ์ AI (JSON) ล่าสุด
+    last_ai_result: List[Dict[str, Any]] = field(default_factory=list)
+
+
+class CameraManager:
+    def __init__(self, sources: Dict[str, str], fps: int = 144, width: int = 640, height: int = 480):
+        self.sources = {k: CameraSource(k, v) for k, v in sources.items()}
+        self.interval = 1.0 / max(1, fps)
+        self.width = width
+        self.height = height
+        self.ai_process_width = width
+        self.ai_process_height = height
+
+        # --- ✨ [ใหม่] State สำหรับการเช็คชื่อ ---
+        self.CHECK_IN_DURATION = 3.0  # (วินาที) ที่ต้องเห็นต่อเนื่อง
+        self.attendance_trackers: Dict[str, Dict[str, float]] = {}
+        self.checked_in_session: Dict[str, Set[str]] = {}
+        self.check_in_queue = queue.Queue()  # คิวกลาง (Thread-safe)
+
+    def _open_cap(self, src: str) -> cv2.VideoCapture:
+        backend = _backend_flag()
+        if src.isdigit():
+            cap = cv2.VideoCapture(int(src), backend)
+        else:
+            cap = cv2.VideoCapture(src)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+        return cap
+
+    def open(self, cam_id: str):
+        cam = self.sources.get(cam_id)
+        if not cam: raise KeyError(f"camera '{cam_id}' not found")
+        if cam.is_open: return
+        cam.cap = self._open_cap(cam.src)
+        if not cam.cap or not cam.cap.isOpened():
+            raise RuntimeError(f"Cannot open camera '{cam_id}' ({cam.src})")
+        cam.is_open = True
+        cam._stop = False
+        cam.ai_queue = queue.Queue(maxsize=1)
+
+        # --- ✨ [ใหม่] สร้าง state ของกล้องสำหรับเช็คชื่อ ---
+        self.attendance_trackers[cam_id] = {}
+        self.checked_in_session[cam_id] = set()
+
+        # สตาร์ท Thread 2 ตัว
+        cam._thread = threading.Thread(target=self._loop_stream, args=(cam,), daemon=True)
+        cam._thread.start()
+        cam._ai_thread = threading.Thread(target=self._loop_ai, args=(cam,), daemon=True)
+        cam._ai_thread.start()
+
+    def close(self, cam_id: str):
+        cam = self.sources.get(cam_id)
+        if not cam: return
+        cam._stop = True
+
+        if cam.ai_queue:
+            cam.ai_queue.put(None)  # ส่งสัญญาณให้ AI thread หยุด
+
+        if cam._thread and cam._thread.is_alive():
+            cam._thread.join(timeout=1.0)
+
+        if cam._ai_thread and cam._ai_thread.is_alive():
+            cam._ai_thread.join(timeout=1.0)
+
+        if cam.cap:
+            cam.cap.release()
+
+        # --- ✨ [ใหม่] ล้าง state ของกล้องที่ปิด ---
+        self.attendance_trackers.pop(cam_id, None)
+        self.checked_in_session.pop(cam_id, None)
+
+        cam.is_open = False
+        cam._thread = None
+        cam._ai_thread = None
+
+    def _loop_stream(self, cam: CameraSource):
+        """Loop 1: สตรีมภาพดิบ (เร็ว, 30+ FPS)"""
+        print(f"[Stream Worker {cam.cam_id}] Started...")
+        while not cam._stop and cam.cap and cam.cap.isOpened():
+            start_time = time.time()
+            ok, frame = cam.cap.read()
+            if not ok or frame is None:
+                time.sleep(0.01)
+                continue
+
+            ok2, jpg = cv2.imencode(".jpg", frame)
+            if ok2:
+                cam.last_frame = jpg.tobytes()
+
+            try:
+                cam.ai_queue.put_nowait(frame.copy())
+            except queue.Full:
+                pass
+
+            processing_time = time.time() - start_time
+            sleep_time = self.interval - processing_time
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+        print(f"[Stream Worker {cam.cam_id}] Stopped.")
+
+    def _loop_ai(self, cam: CameraSource):
+        """Loop 2: ประมวลผล AI (ช้า) + Logic การเช็คชื่อ"""
+        print(f"[AI Worker {cam.cam_id}] Started...")
+
+        # --- ✨ [ใหม่] ดึง state ของกล้องนี้มาใช้ ---
+        trackers = self.attendance_trackers.setdefault(cam.cam_id, {})
+        checked_in = self.checked_in_session.setdefault(cam.cam_id, set())
+        action_map = {"entrance": "enter", "exit": "exit"}
+        current_action = action_map.get(cam.cam_id, cam.cam_id)
+
+        while not cam._stop:
+            try:
+                frame = cam.ai_queue.get()
+                if frame is None:
+                    break
+
+                # 1. ประมวลผล AI (ได้ข้อมูล JSON)
+                ai_results = annotate_and_match(frame)
+                cam.last_ai_result = ai_results  # เก็บผลลัพธ์ให้ WebSocket
+
+                # --- ✨ [ใหม่] Logic การเช็คชื่อ (ย้ายมาไว้ตรงนี้) ---
+                current_time = time.time()
+                seen_in_frame = set()
+
+                for res in ai_results:
+                    if res.get("matched"):  # เช็คว่า AI จำหน้าได้
+                        name = res.get("name")
+                        user_id = res.get("user_id")
+
+                        if name == "Unknown" or not user_id:
+                            continue
+
+                        seen_in_frame.add(name)
+
+                        if name in checked_in:
+                            continue  # คนนี้เช็คชื่อไปแล้ว
+
+                        if name not in trackers:
+                            trackers[name] = current_time  # เริ่มจับเวลา
+                        else:
+                            duration = current_time - trackers[name]
+                            if duration >= self.CHECK_IN_DURATION:
+                                checked_in.add(name)  # มาร์คว่าเช็คแล้ว
+
+                                check_in_data = {
+                                    "user_id": user_id,
+                                    "name": name,
+                                    "action": current_action,  # "enter" or "exit"
+                                    "timestamp": current_time,
+                                    "confidence": res.get("similarity")
+                                }
+                                self.check_in_queue.put(check_in_data)
+                                print(f"✅ [ATTENDANCE] Checked in: {name} (Action: {current_action})")
+                                trackers.pop(name, None)
+
+                # ลบคนที่หายไปจากเฟรม ออกจากตัวจับเวลา
+                lost_names = set(trackers.keys()) - seen_in_frame
+                for name in lost_names:
+                    trackers.pop(name, None)
+                # --- ✨ จบ Logic การเช็คชื่อ ---
+
+            except Exception as e:
+                print(f"[AI Worker {cam.cam_id}] Error: {e}")
+                cam.last_ai_result = []
+                time.sleep(1)
+
+        cam.last_ai_result = []
+        print(f"[AI Worker {cam.cam_id}] Stopped.")
+
+    def get_jpeg(self, cam_id: str) -> bytes:
+        """ฟังก์ชันนี้จะดึง 'ภาพดิบ' จาก Stream Worker"""
+        cam = self.sources.get(cam_id)
+        if not cam:
+            raise KeyError(f"camera '{cam_id}' not found")
+        if not cam.is_open:
+            self.open(cam_id)
+
+        t0 = time.time()
+        while cam.last_frame is None and time.time() - t0 < 2.0:
+            time.sleep(0.05)
+
+        if cam.last_frame is None:
+            raise RuntimeError(f"Could not get frame from camera '{cam_id}' in time")
+        return cam.last_frame
+
+    def list(self):
+        return [{"cam_id": c.cam_id, "src": c.src, "is_open": c.is_open} for c in self.sources.values()]
+
+    def reconfigure(self, new_sources: Dict[str, str]):
+        for k in list(self.sources.keys()):
+            self.close(k)
+        self.sources = {k: CameraSource(k, v) for k, v in new_sources.items()}
+
+    # --- ✨ [ใหม่] ฟังก์ชันสำหรับดึงข้อมูลจากคิว ---
+    def get_attendance_events(self) -> List[dict]:
+        """ดึงข้อมูลการเช็คชื่อทั้งหมดที่ค้างอยู่ในคิว"""
+        events = []
+        while not self.check_in_queue.empty():
+            try:
+                events.append(self.check_in_queue.get_nowait())
+            except queue.Empty:
+                break
+        return events
+
+    def clear_attendance_session(self, cam_id: str):
+        """ล้างรายชื่อคนที่เช็คชื่อไปแล้ว (สำหรับเริ่มวันใหม่ หรือ รีเซ็ต)"""
+        if cam_id in self.checked_in_session:
+            self.checked_in_session[cam_id].clear()
+            print(f"[INFO] Cleared attendance session for {cam_id}")
+            return True
+        return False
+
+
+def discover_local_devices(max_index: int = 10, test_frame: bool = True) -> List[dict]:
+    """สำรวจกล้อง (เหมือนเดิม)"""
+    devices: List[dict] = []
+    backend = _backend_flag()
+
+    candidates: List[str] = []
+    if platform.system() == "Linux":
+        vids = sorted(glob("/dev/video*"))
+        for v in vids:
+            try:
+                idx = str(int(v.split("video")[-1]))
+                candidates.append(idx)
+            except:
+                pass
+    else:  # Windows/macOS
+        candidates = [str(i) for i in range(max_index)]
+
+    seen = set()
+    for src in candidates:
+        if src in seen: continue
+        seen.add(src)
+
+        cap = cv2.VideoCapture(int(src), backend) if src.isdigit() else cv2.VideoCapture(src)
+        opened = cap.isOpened()
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) if opened else 0
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) if opened else 0
+
+        ok_frame = False
+        if opened and test_frame:
+            ok, frame = cap.read()
+            ok_frame = bool(ok and frame is not None)
+
+        if cap: cap.release()
+        devices.append({
+            "src": src,
+            "opened": opened,
+            "readable": ok_frame,
+            "width": w, "height": h
+        })
+    return devices
