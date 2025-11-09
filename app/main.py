@@ -4,12 +4,11 @@ from fastapi import FastAPI, UploadFile, File, Form, WebSocket, WebSocketDisconn
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Optional, List
-from sqlalchemy.orm import Session, selectinload  # ✨ 1. เพิ่ม selectinload
+from sqlalchemy.orm import Session, selectinload
 from sqlalchemy.sql import func
-import os, io, csv, asyncio, base64, time
+import os, io, csv, asyncio, base64, time, shutil  # 👈 เพิ่ม shutil ตรงนี้
 from datetime import datetime, date
 
-# ✨ 2. เพิ่ม StaticFiles
 from fastapi.staticfiles import StaticFiles
 
 from .db_models import get_db, UserFace, User, AttendanceLog, Subject, UserType
@@ -30,9 +29,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ✨ 3. Mount Static Directory
-# นี่คือการบอกว่า URL ที่ขึ้นต้นด้วย /static ให้ไปดึงไฟล์จากโฟลเดอร์ data
-# (สมมติว่าคุณรัน uvicorn จากโฟลเดอร์ root ที่มี app/ และ data/ อยู่)
+# --- 3. Mount Static Directory ---
 app.mount("/static", StaticFiles(directory="data"), name="static")
 
 # --- 2. Camera Manager Setup ---
@@ -83,9 +80,6 @@ def train_refresh(db: Session = Depends(get_db)):
 
 
 # --- 4. Camera Control & MJPEG Stream Endpoints ---
-# ( ... โค้ดส่วน /cameras, /mjpeg, /ws/cameras, /discover, /config ... )
-# ( ... โค้ดส่วน /ws/ai_results ... )
-# ( ... (โค้ดส่วน Attendance API /poll, /logs, /clear) ... )
 @app.get("/cameras")
 def list_cameras():
     return {"cams": cam_mgr.list()}
@@ -326,13 +320,11 @@ def create_user(payload: UserCreate, db: Session = Depends(get_db)):
     }}
 
 
-# ✨✨✨ [ แก้ไข GET /users ] ✨✨✨
-@app.get("/users", response_model=List[dict])  # (เพิ่ม response_model)
+@app.get("/users", response_model=List[dict])
 def list_users(db: Session = Depends(get_db)):
     """
     ดึงรายชื่อผู้ใช้ทั้งหมด (ที่ไม่ถูกลบ) พร้อมรูปภาพ (faces)
     """
-    # ใช้ selectinload(User.faces) เพื่อให้ SQLAlchemy ดึงข้อมูล faces มาพร้อมกัน
     users = db.query(User).options(selectinload(User.faces)).filter(User.is_deleted == 0).all()
 
     results = []
@@ -344,7 +336,6 @@ def list_users(db: Session = Depends(get_db)):
             "role": u.role,
             "user_type_id": u.user_type_id,
             "subject_id": u.subject_id,
-            # ✨ ส่ง List ของ faces กลับไปด้วย
             "faces": [
                 {"face_id": f.face_id, "file_path": f.file_path}
                 for f in u.faces
@@ -353,7 +344,6 @@ def list_users(db: Session = Depends(get_db)):
     return results
 
 
-# ✨✨✨ [ เพิ่ม PUT /users/{user_id} ] ✨✨✨
 class UserUpdate(BaseModel):
     name: Optional[str] = None
     student_code: Optional[str] = None
@@ -371,7 +361,6 @@ def update_user(user_id: int, payload: UserUpdate, db: Session = Depends(get_db)
         user.name = payload.name
         updated = True
     if payload.student_code is not None:
-        # (เช็คว่า student_code ใหม่ซ้ำกับคนอื่นหรือไม่)
         if payload.student_code != user.student_code:
             existing = db.query(User).filter(User.student_code == payload.student_code, User.is_deleted == 0).first()
             if existing:
@@ -387,17 +376,42 @@ def update_user(user_id: int, payload: UserUpdate, db: Session = Depends(get_db)
 
 @app.delete("/users/{user_id}")
 def delete_user(user_id: int, db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.user_id == user_id, User.is_deleted == 0).first()
+    # 1. ค้นหา User พร้อมกับ "faces" ที่ผูกอยู่ด้วย
+    user = db.query(User).options(
+        selectinload(User.faces)
+    ).filter(
+        User.user_id == user_id, User.is_deleted == 0
+    ).first()
+
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    user.is_deleted = 1
-    db.commit()
-    # (เราควรจะสั่ง train ใหม่หลังจากลบ user)
-    # train_refresh(db)
-    return {"message": f"User {user_id} ({user.name}) marked as deleted."}
+
+    # 2. หา Path ของโฟลเดอร์รูปภาพทั้งหมดของ User นี้
+    user_face_dir = os.path.join(MEDIA_ROOT, str(user_id))
+
+    try:
+        # 3. วนลูลบข้อมูลใบหน้า (faces) ออกจากตาราง user_faces
+        if user.faces:
+            for face in user.faces:
+                db.delete(face)
+
+        # 4. มาร์ก user ว่าถูกลบ (Soft Delete)
+        user.is_deleted = 1
+
+        # 5. ยืนยันการลบใน DB (ทั้งลบ faces และอัปเดต is_deleted)
+        db.commit()
+
+        # 6. ลบโฟลเดอร์รูปภาพทั้งหมดของ User นี้ออกจาก Disk
+        if os.path.isdir(user_face_dir):
+            shutil.rmtree(user_face_dir)
+
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to delete user data: {e}")
+
+    return {"message": f"User {user_id} ({user.name}) marked as deleted and all face data removed."}
 
 
-# ✨✨✨ [ เพิ่ม DELETE /faces/{face_id} ] ✨✨✨
 @app.delete("/faces/{face_id}")
 def delete_face(face_id: int, db: Session = Depends(get_db)):
     """
@@ -425,7 +439,6 @@ def delete_face(face_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail=f"Failed to delete face: {e}")
 
 
-# --- 9. Uvicorn Runner ---
 if __name__ == "__main__":
     import uvicorn
 
