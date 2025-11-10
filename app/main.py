@@ -6,8 +6,8 @@ from pydantic import BaseModel
 from typing import Optional, List
 from sqlalchemy.orm import Session, selectinload
 from sqlalchemy.sql import func
-import os, io, csv, asyncio, base64, time, uuid, shutil
-from datetime import datetime, date
+import os, io, csv, asyncio, base64, time, uuid, shutil  # 👈 เพิ่ม shutil
+from datetime import datetime, date, timedelta  # 👈 เพิ่ม timedelta
 
 from .db_models import get_db, UserFace, User, AttendanceLog, Subject, UserType
 from .camera_handler import CameraManager, discover_local_devices
@@ -26,11 +26,9 @@ app.add_middleware(
 
 # --- 2. Mount Static Directories ---
 MEDIA_ROOT = os.getenv("MEDIA_ROOT", "./data/faces/train")
-COVERS_MEDIA_ROOT = "./data/subject_covers"
+# (ลบ COVERS_MEDIA_ROOT และ app.mount ของ /static/covers เพราะ Schema ใหม่ไม่มี cover_image)
 os.makedirs(MEDIA_ROOT, exist_ok=True)
-os.makedirs(COVERS_MEDIA_ROOT, exist_ok=True)
 app.mount("/static", StaticFiles(directory="data"), name="static")
-app.mount("/static/covers", StaticFiles(directory=COVERS_MEDIA_ROOT), name="static_covers")
 
 # --- 3. Camera Manager Setup ---
 print("Discovering local devices for initial setup...")
@@ -67,7 +65,7 @@ async def upload_faces(user_id: int = Form(...), images: list[UploadFile] = File
     os.makedirs(user_dir, exist_ok=True)
     for f in images:
         file_ext = os.path.splitext(f.filename)[1]
-        name = f"{uuid.uuid4()}{file_ext}"
+        name = f"{uuid.uuid4()}{file_ext}"  # ใช้ UUID ป้องกันชื่อซ้ำ
         dest = os.path.join(user_dir, name)
         content = await f.read()
         with open(dest, "wb") as wf: wf.write(content)
@@ -115,48 +113,33 @@ def camera_snapshot(cam_id: str):
 
 @app.get("/cameras/{cam_id}/mjpeg")
 def camera_mjpeg(cam_id: str):
-    """
-    Endpoint นี้จะเปิดกล้องเมื่อถูกเรียก และปิดกล้องเมื่อ Client หลุด
-    """
     boundary = "frame"
 
     async def gen():
         if cam_id not in cam_mgr.sources:
             print(f"MJPEG: Camera ID {cam_id} not found in sources.")
             return
-
         try:
-            # 1. เปิดกล้อง (ถ้ายังไม่เปิด)
             cam_mgr.open(cam_id)
             print(f"Opening MJPEG stream for {cam_id} (Source: {cam_mgr.sources[cam_id].src})")
             while True:
                 try:
-                    # 2. ดึงเฟรม
                     jpg = cam_mgr.get_jpeg(cam_id)
                     if not jpg:
-                        print(f"MJPEG gen received empty frame for {cam_id}. Retrying...")
                         await asyncio.sleep(0.1)
                         continue
-
                     yield (
-                                b"--" + boundary.encode() + b"\r\n" + b"Content-Type: image/jpeg\r\n" + b"Cache-Control: no-cache\r\n" + b"Pragma: no-cache\r\n" + b"Content-Length: " + str(
-                            len(jpg)).encode() + b"\r\n\r\n" + jpg + b"\r\n")
+                            b"--" + boundary.encode() + b"\r\n" + b"Content-Type: image/jpeg\r\n" + b"Cache-Control: no-cache\r\n" + b"Pragma: no-cache\r\n" + b"Content-Length: " + str(
+                        len(jpg)).encode() + b"\r\n\r\n" + jpg + b"\r\n")
                 except Exception as e:
-                    print(f"MJPEG gen error for {cam_id}: {e}")
-                    # (ถ้ากล้องถูกปิดจากภายนอก, cam_mgr.get_jpeg จะ error)
                     if not cam_mgr.sources[cam_id].is_open:
                         print(f"MJPEG {cam_id} stopping because camera is no longer open.")
-                        break  # ออกจาก loop
+                        break
                     await asyncio.sleep(0.1)
-
-                # 3. Sleep ตาม FPS
                 await asyncio.sleep(cam_mgr.interval)
-
         except Exception as e:
             print(f"Could not open camera {cam_id} for MJPEG: {e}")
-
         finally:
-            # 4. ปิดกล้อง เมื่อ Client หลุด
             print(f"Closing MJPEG stream for {cam_id}")
             cam_mgr.close(cam_id)
 
@@ -189,7 +172,6 @@ async def ws_camera(ws: WebSocket, cam_id: str):
 async def ws_ai_results(ws: WebSocket, cam_id: str):
     await ws.accept()
     if cam_id not in cam_mgr.sources: await ws.close(code=1008, reason="Camera not found"); return
-
     cam = cam_mgr.sources[cam_id]
     if not cam.is_open:
         try:
@@ -198,19 +180,16 @@ async def ws_ai_results(ws: WebSocket, cam_id: str):
         except Exception as e:
             await ws.close(code=1011, reason=f"Could not open camera: {e}");
             return
-
     print(f"[WS AI {cam_id}] Client connected.")
     try:
         while True:
             if not cam.is_open:
                 print(f"[WS AI {cam_id}] Camera is closed, disconnecting.")
                 break
-
             results = cam.last_ai_result
             await ws.send_json({"cam_id": cam_id, "results": results, "ai_width": cam_mgr.ai_process_width,
                                 "ai_height": cam_mgr.ai_process_height})
             await asyncio.sleep(0.1)
-
     except WebSocketDisconnect:
         print(f"[WS AI {cam_id}] Client disconnected.")
     except Exception as e:
@@ -224,12 +203,7 @@ async def cameras_discover(max_index: int = 10, test_frame: bool = True):
     print("Discovering local devices...")
     active_sources = [c.src for c in cam_mgr.sources.values() if c.is_open]
     print(f"Active sources (will skip test): {active_sources}")
-
-    devs = discover_local_devices(
-        max_index=max_index,
-        test_frame=test_frame,
-        exclude_srcs=active_sources
-    )
+    devs = discover_local_devices(max_index=max_index, test_frame=test_frame, exclude_srcs=active_sources)
     print(f"Discovery found: {devs}")
     return {"devices": devs}
 
@@ -260,39 +234,49 @@ def stop_attendance():
     return {"message": "Attendance stopped"}
 
 
+COOLDOWN_MINUTES = 2  # กันบันทึกซ้ำเร็วเกินไป
+
+
 @app.get("/attendance/poll", response_model=List[dict])
 async def get_attendance_events(db: Session = Depends(get_db)):
     events = cam_mgr.get_attendance_events()
     if not events: return []
-    today = date.today()
+
     new_logs_for_frontend = []
     user_ids_to_check = {e["user_id"] for e in events if e.get("user_id")}
     if not user_ids_to_check: return []
-    users_data = db.query(User.user_id, User.subject_id, User.student_code, User.name).filter(
-        User.user_id.in_(user_ids_to_check)).all()
+
+    users_data = db.query(
+        User.user_id, User.subject_id, User.student_code, User.name
+    ).filter(User.user_id.in_(user_ids_to_check)).all()
     user_info_map = {u.user_id: u for u in users_data}
+
     for event in events:
         user_id = event.get("user_id")
         if not user_id or user_id not in user_info_map: continue
+
         user_info = user_info_map[user_id]
-        existing_log = db.query(AttendanceLog).filter(AttendanceLog.user_id == user_id,
-                                                      AttendanceLog.action == event["action"],
-                                                      func.date(AttendanceLog.timestamp) == today).first()
-        if not existing_log:
-            event_timestamp = datetime.fromtimestamp(event["timestamp"])
+        event_timestamp = datetime.fromtimestamp(event["timestamp"])
+
+        last_log = db.query(AttendanceLog).filter(
+            AttendanceLog.user_id == user_id,
+            AttendanceLog.action == event["action"]
+        ).order_by(AttendanceLog.timestamp.desc()).first()
+
+        if not last_log or (event_timestamp - last_log.timestamp) > timedelta(minutes=COOLDOWN_MINUTES):
             new_log_db = AttendanceLog(
                 user_id=user_id, subject_id=user_info.subject_id, action=event["action"],
                 timestamp=event_timestamp, confidence=event.get("confidence")
             )
             db.add(new_log_db);
             db.flush()
-            new_log_data = {
+            new_logs_for_frontend.append({
                 "log_id": new_log_db.log_id, "user_id": user_id,
                 "user_name": user_info.name, "student_code": user_info.student_code or "N/A",
                 "action": event["action"], "timestamp": event_timestamp.isoformat(),
                 "confidence": event.get("confidence")
-            }
-            new_logs_for_frontend.append(new_log_data)
+            })
+
     if new_logs_for_frontend: db.commit()
     return new_logs_for_frontend
 
@@ -311,10 +295,11 @@ async def get_attendance_logs(
         .outerjoin(Subject, AttendanceLog.subject_id == Subject.subject_id)
         .order_by(AttendanceLog.timestamp.desc())
     )
-    query = query.filter(User.is_deleted == 0)
+    query = query.filter(User.is_deleted == 0)  # กรอง User ที่ยังไม่ถูกลบ
     if start_date: query = query.filter(func.date(AttendanceLog.timestamp) >= start_date)
     if end_date: query = query.filter(func.date(AttendanceLog.timestamp) <= end_date)
     if subject_id is not None: query = query.filter(AttendanceLog.subject_id == subject_id)
+
     logs = query.all()
     results = []
     for log, user_name, student_code, subject_name in logs:
@@ -337,49 +322,22 @@ async def clear_attendance_log(cam_id: str):
 
 
 # --- 7. User Management & Subject Endpoints ---
-@app.get("/subjects", response_model=List[dict])
-def list_subjects(db: Session = Depends(get_db)):
-    subjects = db.query(Subject).all()
-    return [
-        {"subject_id": s.subject_id, "subject_name": s.subject_name, "section": s.section,
-         "cover_image_path": s.cover_image_path}
-        for s in subjects
-    ]
+
+# ✨ Pydantic Models สำหรับ Subject (Schema ใหม่)
+class SubjectCreate(BaseModel):
+    subject_name: str
+    section: Optional[str] = None
+    schedule: Optional[str] = None
 
 
-@app.post("/subjects")
-async def create_subject(
-        subject_name: str = Form(...),
-        section: Optional[str] = Form(None),
-        cover_image: Optional[UploadFile] = File(None),
-        db: Session = Depends(get_db)
-):
-    existing = db.query(Subject).filter(Subject.subject_name == subject_name, Subject.section == section).first()
-    if existing:
-        raise HTTPException(status_code=400, detail="Subject with this name and section already exists")
-    image_path = None
-    if cover_image:
-        file_ext = os.path.splitext(cover_image.filename)[1]
-        name = f"{uuid.uuid4()}{file_ext}"
-        dest = os.path.join(COVERS_MEDIA_ROOT, name)
-        with open(dest, "wb") as wf: wf.write(await cover_image.read())
-        image_path = name
-    new_subject = Subject(
-        subject_name=subject_name,
-        section=section,
-        cover_image_path=image_path
-    )
-    db.add(new_subject);
-    db.commit();
-    db.refresh(new_subject)
-    return {
-        "subject_id": new_subject.subject_id,
-        "subject_name": new_subject.subject_name,
-        "section": new_subject.section,
-        "cover_image_path": new_subject.cover_image_path
-    }
+class SubjectResponse(SubjectCreate):
+    subject_id: int
+
+    class Config:  # 👈 เพิ่ม Config.from_attributes (ORM mode)
+        from_attributes = True
 
 
+# Pydantic Models สำหรับ User
 class UserCreate(BaseModel):
     student_code: Optional[str] = None
     name: str;
@@ -393,6 +351,38 @@ class UserUpdate(BaseModel):
     name: Optional[str] = None
     student_code: Optional[str] = None
     role: Optional[str] = None
+
+
+# ✨ [แก้ไข] GET /subjects
+@app.get("/subjects", response_model=List[SubjectResponse])
+def list_subjects(db: Session = Depends(get_db)):
+    subjects = db.query(Subject).all()
+    return subjects  # 👈 return object Subject ตรงๆ ได้เลยถ้าใช้ ORM mode
+
+
+# ✨ [แก้ไข] POST /subjects
+@app.post("/subjects", response_model=SubjectResponse)
+def create_subject(subject: SubjectCreate, db: Session = Depends(get_db)):
+    existing = db.query(Subject).filter(
+        Subject.subject_name == subject.subject_name,
+        Subject.section == subject.section
+    ).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Subject with this name and section already exists")
+
+    new_subject = Subject(
+        subject_name=subject.subject_name,
+        section=subject.section,
+        schedule=subject.schedule
+    )
+    try:
+        db.add(new_subject);
+        db.commit();
+        db.refresh(new_subject)
+        return new_subject
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.post("/users")
@@ -462,6 +452,7 @@ def update_user(user_id: int, payload: UserUpdate, db: Session = Depends(get_db)
     return {"message": "User updated", "user_id": user.user_id}
 
 
+# ✨ [แก้ไข] DELETE /users/{user_id} (เวอร์ชันล่าสุดที่ลบไฟล์และเปลี่ยน student_code)
 @app.delete("/users/{user_id}")
 def delete_user(user_id: int, db: Session = Depends(get_db)):
     user = db.query(User).options(selectinload(User.faces)).filter(User.user_id == user_id,
@@ -469,14 +460,26 @@ def delete_user(user_id: int, db: Session = Depends(get_db)):
     if not user: raise HTTPException(status_code=404, detail="User not found")
     user_face_dir = os.path.join(MEDIA_ROOT, str(user_id))
     try:
+        # 1. ลบข้อมูล faces ใน DB
         if user.faces:
             for face in user.faces: db.delete(face)
+
+        # 2. อัปเดต User (Soft delete + แก้ student_code)
         user.is_deleted = 1
-        if user.student_code: user.student_code = f"{user.student_code}_deleted_{int(time.time())}"
+        if user.student_code:
+            user.student_code = f"{user.student_code}_deleted_{int(time.time())}"
+
+        # 3. Commit การเปลี่ยนแปลงใน DB
         db.commit()
-        if os.path.isdir(user_face_dir): shutil.rmtree(user_face_dir)
+
+        # 4. ลบโฟลเดอร์รูปภาพออกจาก Disk
+        if os.path.isdir(user_face_dir):
+            shutil.rmtree(user_face_dir)
+
     except Exception as e:
-        db.rollback(); raise HTTPException(status_code=500, detail=f"Failed to delete user data: {e}")
+        db.rollback();
+        raise HTTPException(status_code=500, detail=f"Failed to delete user data: {e}")
+
     return {"message": f"User {user_id} ({user.name}) marked as deleted and all face data removed."}
 
 
