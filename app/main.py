@@ -5,9 +5,11 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Optional, List
 from sqlalchemy.orm import Session, selectinload
-from sqlalchemy.sql import func
+from sqlalchemy.sql import func, asc
 import os, io, csv, asyncio, base64, time, uuid, shutil  # 👈 เพิ่ม shutil
 from datetime import datetime, date, timedelta  # 👈 เพิ่ม timedelta
+
+from fastapi.responses import JSONResponse
 
 from .db_models import get_db, UserFace, User, AttendanceLog, Subject, UserType
 from .camera_handler import CameraManager, discover_local_devices
@@ -498,6 +500,88 @@ def delete_face(face_id: int, db: Session = Depends(get_db)):
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Failed to delete face: {e}")
+
+
+@app.get("/attendance/export")
+def export_attendance_logs(
+        subject_id: Optional[int] = None,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+        db: Session = Depends(get_db)
+):
+    query = (
+        db.query(
+            AttendanceLog.user_id,
+            User.name.label("user_name"),
+            User.student_code,
+            AttendanceLog.subject_id,
+            Subject.subject_name,
+            func.date(AttendanceLog.timestamp).label("log_date"),
+            AttendanceLog.action,
+            AttendanceLog.timestamp,
+        )
+        # ✨ [แก้ไขที่ 1] เปลี่ยนจาก .join เป็น .outerjoin
+        .outerjoin(User, AttendanceLog.user_id == User.user_id)
+        # ✨ (อันนี้ควรแก้แล้วจากรอบก่อน)
+        .outerjoin(Subject, AttendanceLog.subject_id == Subject.subject_id)
+        # ✨ [แก้ไขที่ 2] ย้าย Filter นี้มาไว้หลัง Join
+        # .filter(User.is_deleted == 0)
+        .order_by(AttendanceLog.user_id, AttendanceLog.timestamp.asc())
+    )
+
+    # ✨ [แก้ไขที่ 3] กรอง is_deleted ตรงนี้แทน
+    # (ต้องเช็ค User.is_deleted != 1 เพราะถ้าเป็น NULL (จาก outerjoin) ก็ยังเอา)
+    query = query.filter(User.is_deleted != 1)
+
+    if subject_id:
+        query = query.filter(AttendanceLog.subject_id == subject_id)
+    if start_date:
+        query = query.filter(func.date(AttendanceLog.timestamp) >= start_date)
+    if end_date:
+        query = query.filter(func.date(AttendanceLog.timestamp) <= end_date)
+
+    logs = query.all()
+
+    # จัดกลุ่มตาม user + วัน
+    grouped = {}
+    for log in logs:
+        # ✨ [แก้ไขที่ 4] เผื่อ user_id เป็น None จาก Outer Join
+        key = (log.user_id if log.user_id else 'UNKNOWN', log.log_date)
+        grouped.setdefault(key, []).append(log)
+
+    results = []
+    for (uid, log_date), entries in grouped.items():
+
+        ins = [e for e in entries if e.action.lower() == "enter"]
+        outs = [e for e in entries if e.action.lower() == "exit"]
+
+        if not ins:
+            continue  # ไม่มีการเข้า
+
+        in_time = ins[0].timestamp
+        out_time = outs[-1].timestamp if outs else None
+
+        duration = timedelta(0)
+        if out_time:
+            duration = out_time - in_time
+
+        user_name = entries[0].user_name if entries[0].user_name else "Unknown User"
+        student_code = entries[0].student_code if entries[0].student_code else "N/A"
+
+        results.append({
+            "user_id": uid,
+            "user_name": user_name,
+            "student_code": student_code,
+            "subject_id": entries[0].subject_id,
+            "subject_name": entries[0].subject_name if entries[0].subject_name else "N/A",
+            "date": log_date.isoformat(),
+            "in_time": in_time.isoformat(),
+            "out_time": out_time.isoformat() if out_time else None,
+            "duration_minutes": round(duration.total_seconds() / 60, 2),
+            "status": "Present" if out_time else "No Exit"
+        })
+
+    return JSONResponse(content=results)
 
 
 # --- 9. Uvicorn Runner ---
