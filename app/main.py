@@ -395,10 +395,14 @@ def delete_user(user_id: int, db: Session = Depends(get_db)):
             for face in user.faces:
                 db.delete(face)
 
-        # 4. มาร์ก user ว่าถูกลบ (Soft Delete)
+        # 4. มาร์ก user ว่าถูกลบ (Soft Delete) และเปลี่ยน student_code
         user.is_deleted = 1
+        if user.student_code:
+             # เปลี่ยน student_code เพื่อป้องกันการซ้ำในอนาคต
+             # เช่น จาก "6601" เป็น "6601_deleted_1700000000"
+             user.student_code = f"{user.student_code}_deleted_{int(time.time())}"
 
-        # 5. ยืนยันการลบใน DB (ทั้งลบ faces และอัปเดต is_deleted)
+        # 5. ยืนยันการลบใน DB (ทั้งลบ faces, อัปเดต is_deleted และ student_code)
         db.commit()
 
         # 6. ลบโฟลเดอร์รูปภาพทั้งหมดของ User นี้ออกจาก Disk
