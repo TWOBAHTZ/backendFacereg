@@ -6,7 +6,7 @@ from pydantic import BaseModel
 from typing import Optional, List
 from sqlalchemy.orm import Session, selectinload
 from sqlalchemy.sql import func
-import os, io, csv, asyncio, base64, time, uuid
+import os, io, csv, asyncio, base64, time, uuid, shutil
 from datetime import datetime, date
 
 from .db_models import get_db, UserFace, User, AttendanceLog, Subject, UserType
@@ -32,7 +32,7 @@ os.makedirs(COVERS_MEDIA_ROOT, exist_ok=True)
 app.mount("/static", StaticFiles(directory="data"), name="static")
 app.mount("/static/covers", StaticFiles(directory=COVERS_MEDIA_ROOT), name="static_covers")
 
-# --- 3. Camera Manager Setup (✨ [แก้ไข] ส่วนนี้) ---
+# --- 3. Camera Manager Setup ---
 print("Discovering local devices for initial setup...")
 discovered_devices = discover_local_devices(test_frame=False)
 available_sources = [d['src'] for d in discovered_devices if d.get('opened', False)]
@@ -52,8 +52,6 @@ else:
 print(f"Assigning camera sources: {CAMERA_SOURCES}")
 cam_mgr = CameraManager(CAMERA_SOURCES, fps=30, width=640, height=480)
 
-
-# --- (จบส่วนแก้ไข) ---
 
 @app.on_event("startup")
 async def _startup():
@@ -85,7 +83,7 @@ async def upload_faces(user_id: int = Form(...), images: list[UploadFile] = File
 def train_refresh(db: Session = Depends(get_db)):
     rows = (
         db.query(UserFace.user_id, UserFace.file_path, User.name)
-        .join(User, User.user_id == UserFace.user_id).all()
+        .join(User, User.user_id == User.user_id).all()
     )
     users, total = refresh_facebank_from_db(rows)
     cnt = load_facebank()
@@ -115,7 +113,6 @@ def camera_snapshot(cam_id: str):
     return Response(content=jpg, media_type="image/jpeg")
 
 
-# ✨✨✨ [ แก้ไข ENDPOINT นี้ ] ✨✨✨
 @app.get("/cameras/{cam_id}/mjpeg")
 def camera_mjpeg(cam_id: str):
     """
@@ -124,6 +121,10 @@ def camera_mjpeg(cam_id: str):
     boundary = "frame"
 
     async def gen():
+        if cam_id not in cam_mgr.sources:
+            print(f"MJPEG: Camera ID {cam_id} not found in sources.")
+            return
+
         try:
             # 1. เปิดกล้อง (ถ้ายังไม่เปิด)
             cam_mgr.open(cam_id)
@@ -132,12 +133,21 @@ def camera_mjpeg(cam_id: str):
                 try:
                     # 2. ดึงเฟรม
                     jpg = cam_mgr.get_jpeg(cam_id)
+                    if not jpg:
+                        print(f"MJPEG gen received empty frame for {cam_id}. Retrying...")
+                        await asyncio.sleep(0.1)
+                        continue
+
                     yield (
                                 b"--" + boundary.encode() + b"\r\n" + b"Content-Type: image/jpeg\r\n" + b"Cache-Control: no-cache\r\n" + b"Pragma: no-cache\r\n" + b"Content-Length: " + str(
                             len(jpg)).encode() + b"\r\n\r\n" + jpg + b"\r\n")
                 except Exception as e:
                     print(f"MJPEG gen error for {cam_id}: {e}")
-                    await asyncio.sleep(0.1)  # พักถ้าดึงเฟรมไม่ได้
+                    # (ถ้ากล้องถูกปิดจากภายนอก, cam_mgr.get_jpeg จะ error)
+                    if not cam_mgr.sources[cam_id].is_open:
+                        print(f"MJPEG {cam_id} stopping because camera is no longer open.")
+                        break  # ออกจาก loop
+                    await asyncio.sleep(0.1)
 
                 # 3. Sleep ตาม FPS
                 await asyncio.sleep(cam_mgr.interval)
@@ -179,41 +189,46 @@ async def ws_camera(ws: WebSocket, cam_id: str):
 async def ws_ai_results(ws: WebSocket, cam_id: str):
     await ws.accept()
     if cam_id not in cam_mgr.sources: await ws.close(code=1008, reason="Camera not found"); return
+
     cam = cam_mgr.sources[cam_id]
     if not cam.is_open:
         try:
+            print(f"WS AI opening camera {cam_id}...")
             cam_mgr.open(cam_id)
         except Exception as e:
-            await ws.close(code=1011, reason=f"Could not open camera: {e}"); return
+            await ws.close(code=1011, reason=f"Could not open camera: {e}");
+            return
+
     print(f"[WS AI {cam_id}] Client connected.")
     try:
         while True:
+            if not cam.is_open:
+                print(f"[WS AI {cam_id}] Camera is closed, disconnecting.")
+                break
+
             results = cam.last_ai_result
             await ws.send_json({"cam_id": cam_id, "results": results, "ai_width": cam_mgr.ai_process_width,
                                 "ai_height": cam_mgr.ai_process_height})
             await asyncio.sleep(0.1)
+
     except WebSocketDisconnect:
         print(f"[WS AI {cam_id}] Client disconnected.")
     except Exception as e:
         print(f"[WS AI {cam_id}] Error: {e}")
+    finally:
+        print(f"[WS AI {cam_id}] Connection closed.")
 
 
-# ✨✨✨ [ แก้ไข ENDPOINT นี้ ] ✨✨✨
 @app.get("/cameras/discover")
 async def cameras_discover(max_index: int = 10, test_frame: bool = True):
-    """
-    สำรวจ device ที่เปิดได้ (จะไม่ไปยุ่งกับกล้องที่เปิดใช้งานอยู่)
-    """
     print("Discovering local devices...")
-    # 1. หว่ากล้องไหน (src) กำลังถูกใช้
     active_sources = [c.src for c in cam_mgr.sources.values() if c.is_open]
     print(f"Active sources (will skip test): {active_sources}")
 
-    # 2. ค้นหา โดยส่ง src ที่ใช้แล้วเข้าไป
     devs = discover_local_devices(
         max_index=max_index,
         test_frame=test_frame,
-        exclude_srcs=active_sources  # (ฟังก์ชันใน handler จะข้ามการ test src พวกนี้)
+        exclude_srcs=active_sources
     )
     print(f"Discovery found: {devs}")
     return {"devices": devs}
@@ -223,16 +238,10 @@ async def cameras_discover(max_index: int = 10, test_frame: bool = True):
 def get_camera_config(): return {"mapping": {k: v.src for k, v in cam_mgr.sources.items()}}
 
 
-# ✨✨✨ [ แก้ไข ENDPOINT นี้ ] ✨✨✨
 @app.post("/cameras/config")
 def set_camera_config(mapping: dict = Body(..., example={"entrance": "0", "exit": "1"})):
-    """
-    ตั้งค่ากล้องใหม่ (Endpoint นี้จะเป็นคน reconfigure เอง)
-    """
     print(f"Reconfiguring cameras to: {mapping}")
-    # reconfigure จะปิดกล้องเก่า และอัปเดต sources
     cam_mgr.reconfigure(mapping)
-    # (mjpeg/ws จะเรียก .open() เองเมื่อ Frontend เชื่อมต่อใหม่)
     return {"message": "camera mapping updated", "mapping": mapping}
 
 
@@ -455,19 +464,27 @@ def update_user(user_id: int, payload: UserUpdate, db: Session = Depends(get_db)
 
 @app.delete("/users/{user_id}")
 def delete_user(user_id: int, db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.user_id == user_id, User.is_deleted == 0).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-    user.is_deleted = 1
-    db.commit()
-    return {"message": f"User {user_id} ({user.name}) marked as deleted."}
+    user = db.query(User).options(selectinload(User.faces)).filter(User.user_id == user_id,
+                                                                   User.is_deleted == 0).first()
+    if not user: raise HTTPException(status_code=404, detail="User not found")
+    user_face_dir = os.path.join(MEDIA_ROOT, str(user_id))
+    try:
+        if user.faces:
+            for face in user.faces: db.delete(face)
+        user.is_deleted = 1
+        if user.student_code: user.student_code = f"{user.student_code}_deleted_{int(time.time())}"
+        db.commit()
+        if os.path.isdir(user_face_dir): shutil.rmtree(user_face_dir)
+    except Exception as e:
+        db.rollback(); raise HTTPException(status_code=500, detail=f"Failed to delete user data: {e}")
+    return {"message": f"User {user_id} ({user.name}) marked as deleted and all face data removed."}
 
 
 @app.delete("/faces/{face_id}")
 def delete_face(face_id: int, db: Session = Depends(get_db)):
     face = db.query(UserFace).filter(UserFace.face_id == face_id).first()
     if not face:
-        raise HTTPException(status_code=4404, detail="Face image not found")
+        raise HTTPException(status_code=404, detail="Face image not found")
     try:
         file_path = os.path.join(MEDIA_ROOT, str(face.user_id), face.file_path)
         db.delete(face);

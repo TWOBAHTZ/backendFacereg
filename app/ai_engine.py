@@ -5,7 +5,7 @@ import os
 import cv2
 import json
 import numpy as np
-from typing import Dict, Tuple, List, Optional, Any
+from typing import Dict, Tuple, List, Optional, Any  # ✨ (ต้องมี Any)
 from insightface.app import FaceAnalysis
 
 # ===== Config =====
@@ -114,7 +114,7 @@ def _best_match(emb: np.ndarray) -> Tuple[Optional[int], float]:
     return best_uid, float(best_sim)
 
 
-# ✨✨✨ --- นี่คือฟังก์ชันที่แก้ไข --- ✨✨✨
+# ✨✨✨ [ นี่คือฟังก์ชันที่แก้ไข ] ✨✨✨
 def annotate_and_match(frame: np.ndarray) -> List[Dict[str, Any]]:
     """
     ค้นหาใบหน้า, เปรียบเทียบ, และคืนค่าเป็น List[dict] ของข้อมูล
@@ -122,7 +122,7 @@ def annotate_and_match(frame: np.ndarray) -> List[Dict[str, Any]]:
     """
     app = _ensure_app()
     faces = app.get(frame)
-    results: List[Dict[str, Any]] = []
+    results: List[Dict[str, Any]] = []  # ✨
 
     for f in faces:
         x1, y1, x2, y2 = f.bbox.astype(int)
@@ -140,20 +140,26 @@ def annotate_and_match(frame: np.ndarray) -> List[Dict[str, Any]]:
             name = "Unknown"
             display_name = "Unknown"
             matched = False
-            uid = None  # ✨ (สำคัญ) ต้องมั่นใจว่า uid เป็น None ถ้าไม่ Match
+            uid = None  # (สำคัญ)
 
+        # คำนวณ w, h
         w = x2 - x1
         h = y2 - y1
 
+        # ✨ สร้าง dict ข้อมูล (ไม่รวม label ที่คำนวณ %)
         result_data = {
             "name": name,
-            "box": [int(x1), int(y1), int(w), int(h)],
+            "box": [int(x1), int(y1), int(w), int(h)],  # ส่งเป็น [x, y, w, h]
             "similarity": float(sim) if sim is not None else None,
             "matched": matched,
-            "display_name": display_name,
-            "user_id": uid  # ✨✨✨ เพิ่มบรรทัดนี้ ✨✨✨
+            "display_name": display_name,  # (ส่งชื่อที่แสดงผลไปให้ Frontend)
+            "user_id": uid  # (ส่ง user_id ไปด้วย)
         }
         results.append(result_data)
 
-    return results
+        # ❌ ลบส่วนที่วาดออก ❌
+        # cv2.rectangle(...)
+        # cv2.putText(...)
+
+    return results  # ✅ คืนค่าเป็น List[dict]
 # ✨✨✨ --- จบฟังก์ชันที่แก้ไข --- ✨✨✨
