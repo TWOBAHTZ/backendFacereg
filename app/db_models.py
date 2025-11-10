@@ -81,7 +81,7 @@ class User(Base):
     __tablename__ = "users"
 
     user_id:       Mapped[int]  = mapped_column(Integer, primary_key=True, autoincrement=True)
-    student_code:  Mapped[Optional[str]] = mapped_column(String(50), unique=True, index=True)
+    student_code:  Mapped[Optional[str]] = mapped_column(String(50), index=True)
     name:          Mapped[str]  = mapped_column(String(255), nullable=False)
     role:          Mapped[str]  = mapped_column(Enum("admin", "operator", "viewer", name="user_role"), nullable=False)
     user_type_id:  Mapped[Optional[int]] = mapped_column(ForeignKey("user_types.user_type_id", ondelete="SET NULL"))
