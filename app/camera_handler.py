@@ -48,6 +48,10 @@ class CameraManager:
         self.checked_in_session: Dict[str, Set[str]] = {}
         self.check_in_queue = queue.Queue()
 
+        # ✨ [ แก้ไข ] เพิ่ม 2 State นี้
+        self.active_roster: Optional[Set[int]] = None
+        self.active_subject_id: Optional[int] = None  # (เพิ่มตัวแปรนี้)
+
     def _open_cap(self, src: str) -> cv2.VideoCapture:
         backend = _backend_flag()
         if src.isdigit():
@@ -69,8 +73,8 @@ class CameraManager:
                 raise RuntimeError(f"Cannot open camera '{cam_id}' ({cam.src})")
         except Exception as e:
             print(f"Failed to open cap for {cam_id}: {e}")
-            self.close(cam_id)  # (ถ้าเปิดไม่สำเร็จ ให้ cleanup)
-            raise e  # (ส่ง error ต่อ)
+            self.close(cam_id)
+            raise e
 
         cam.is_open = True
         cam._stop = False
@@ -85,38 +89,26 @@ class CameraManager:
         cam._ai_thread.start()
         print(f"[CameraManager] Opened camera {cam_id} (Src: {cam.src})")
 
-    # ✨✨✨ [ แก้ไขฟังก์ชันนี้ ] ✨✨✨
     def close(self, cam_id: str):
         cam = self.sources.get(cam_id)
         if not cam: return
-
-        # (ถ้ากล้องปิดอยู่แล้ว ก็ไม่ต้องทำอะไร)
         if not cam.is_open and not cam._thread and not cam._ai_thread:
             return
 
         print(f"[CameraManager] Closing camera {cam_id}...")
         cam._stop = True
 
-        # 1. ส่งสัญญาณให้ AI thread หยุด (สำคัญมาก)
         if cam.ai_queue:
             try:
                 cam.ai_queue.put_nowait(None)
             except queue.Full:
-                pass  # (ถ้าคิวเต็ม ก็ไม่เป็นไร)
+                pass
 
-        # 2. รอให้ Stream thread หยุด (ตัวนี้จะหยุดเร็ว)
         if cam._thread and cam._thread.is_alive():
             cam._thread.join(timeout=1.0)
-            if cam._thread.is_alive():
-                print(f"[WARN] Stream worker {cam.cam_id} failed to join.")
-
-        # 3. รอให้ AI thread หยุด (ตัวนี้อาจจะช้า)
         if cam._ai_thread and cam._ai_thread.is_alive():
             cam._ai_thread.join(timeout=1.0)
-            if cam._ai_thread.is_alive():
-                print(f"[WARN] AI worker {cam.cam_id} failed to join.")
 
-        # 4. คืนค่ากล้อง (สำคัญมาก)
         if cam.cap:
             try:
                 cam.cap.release()
@@ -128,25 +120,19 @@ class CameraManager:
         cam.is_open = False
         cam._thread = None
         cam._ai_thread = None
-
         self.attendance_trackers.pop(cam_id, None)
         self.checked_in_session.pop(cam_id, None)
-
         print(f"[CameraManager] Successfully closed camera {cam_id}")
 
     def _loop_stream(self, cam: CameraSource):
-        """Loop 1: สตรีมภาพดิบ (เร็ว)"""
         print(f"[Stream Worker {cam.cam_id}] Started...")
         while not cam._stop and cam.cap and cam.cap.isOpened():
             start_time = time.time()
-
-            # ✨ [แก้ไข] เพิ่มการตรวจสอบ cam.cap อีกชั้น
             if not cam.cap: break
-
             ok, frame = cam.cap.read()
             if not ok or frame is None:
                 print(f"[Stream Worker {cam.cam_id}] Frame read error.")
-                time.sleep(0.1)  # พัก 0.1 วิ ถ้าอ่านเฟรมไม่ได้
+                time.sleep(0.1)
                 continue
 
             ok2, jpg = cv2.imencode(".jpg", frame)
@@ -163,7 +149,6 @@ class CameraManager:
         print(f"[Stream Worker {cam.cam_id}] Stopped.")
 
     def _loop_ai(self, cam: CameraSource):
-        """Loop 2: ประมวลผล AI (ช้า) + Logic การเช็คชื่อ"""
         print(f"[AI Worker {cam.cam_id}] Started...")
 
         trackers = self.attendance_trackers.setdefault(cam.cam_id, {})
@@ -173,16 +158,12 @@ class CameraManager:
 
         while not cam._stop:
             try:
-                # ✨ [แก้ไข] ใช้ timeout เพื่อให้ Loop นี้ไม่ค้างตลอดไป
                 frame = cam.ai_queue.get(timeout=1.0)
-                if frame is None:
-                    break
-
+                if frame is None: break
                 if cam.is_ai_paused:
                     cam.last_ai_result = []
-                    if trackers:
-                        trackers.clear()
-                    continue  # (Sleep 1 วิ ไปในตัว)
+                    if trackers: trackers.clear()
+                    continue
 
                 ai_results = annotate_and_match(frame)
                 cam.last_ai_result = ai_results
@@ -195,6 +176,12 @@ class CameraManager:
                         name = res.get("name")
                         user_id = res.get("user_id")
                         if name == "Unknown" or not user_id: continue
+
+                        # (Logic ตรวจสอบ Roster - เหมือนเดิม)
+                        if self.active_roster is not None and user_id not in self.active_roster:
+                            res["display_name"] = f"{name} (Not in class)"
+                            continue
+
                         seen_in_frame.add(name)
                         if name in checked_in: continue
 
@@ -221,7 +208,6 @@ class CameraManager:
                     trackers.pop(name, None)
 
             except queue.Empty:
-                # (ถ้าไม่มีเฟรมใหม่ใน 1 วิ ก็วนลูปเช็ค _stop และ is_ai_paused ใหม่)
                 pass
             except Exception as e:
                 print(f"[AI Worker {cam.cam_id}] Error: {e}")
@@ -244,10 +230,8 @@ class CameraManager:
             time.sleep(0.05)
 
         if cam.last_frame is None:
-            # ✨ [แก้ไข] อย่าใช้ raise RuntimeError เพราะจะทำให้ mjpeg gen() ล่ม
-            # raise RuntimeError(f"Could not get frame from camera '{cam_id}' in time")
             print(f"[WARN] get_jpeg timeout for {cam_id}")
-            return b''  # ส่งเฟรมเปล่าแทน
+            return b''
         return cam.last_frame
 
     def list(self):
@@ -256,10 +240,21 @@ class CameraManager:
     def reconfigure(self, new_sources: Dict[str, str]):
         for k in list(self.sources.keys()):
             self.close(k)
-        # (รอ 1 วินาที ให้ OS คืนค่ากล้องทั้งหมดก่อน)
         time.sleep(1.0)
         self.sources = {k: CameraSource(k, v) for k, v in new_sources.items()}
         print(f"Reconfigured. New sources: {self.sources}")
+
+    # ✨ [ แก้ไข ] เพิ่ม subject_id เข้ามา
+    def set_active_roster(self, user_ids: Optional[Set[int]], subject_id: Optional[int]):
+        """
+        อัปเดต Roster (บัญชีรายชื่อ) และ Subject ID ที่กำลัง Active
+        """
+        self.active_roster = user_ids
+        self.active_subject_id = subject_id  # (เพิ่มบรรทัดนี้)
+
+        for trackers in self.attendance_trackers.values():
+            trackers.clear()
+        print(f"[CameraManager] Active subject ID: {subject_id}. Roster size: {len(user_ids) if user_ids else 'ALL'}")
 
     def get_attendance_events(self) -> List[dict]:
         events = []
@@ -278,7 +273,6 @@ class CameraManager:
         return False
 
 
-# (discover_local_devices - เหมือนเดิมจากไฟล์ที่แล้ว)
 def discover_local_devices(
         max_index: int = 10,
         test_frame: bool = True,

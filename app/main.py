@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session, selectinload
 from sqlalchemy.sql import func
 from sqlalchemy import or_
 import os, io, csv, asyncio, base64, time, uuid
-from datetime import datetime, date  # ✨ (มี 'date' แล้ว)
+from datetime import datetime, date
 import pandas as pd
 
 from .db_models import get_db, UserFace, User, AttendanceLog, Subject, UserType
@@ -209,6 +209,34 @@ def set_camera_config(mapping: dict = Body(..., example={"entrance": "0", "exit"
 
 
 # --- 6. Attendance API Endpoints ---
+class ActiveSubjectPayload(BaseModel):
+    subject_id: Optional[int] = None
+
+
+# ✨ [ 1. แก้ไข Endpoint นี้ ]
+@app.post("/attendance/set_active_subject")
+def set_active_subject(payload: ActiveSubjectPayload, db: Session = Depends(get_db)):
+    active_user_ids: Optional[set] = None
+    roster_size = 0
+
+    if payload.subject_id is not None:
+        users_in_subject = db.query(User.user_id).filter(
+            User.subject_id == payload.subject_id,
+            User.is_deleted == 0
+        ).all()
+        active_user_ids = {user.user_id for user in users_in_subject}
+        roster_size = len(active_user_ids)
+        print(f"[Attendance] Setting active subject {payload.subject_id}. Roster size: {roster_size}")
+    else:
+        print("[Attendance] Setting active subject to ALL.")
+        active_user_ids = None
+
+    # (ส่ง subject_id ไปให้ cam_mgr ด้วย)
+    cam_mgr.set_active_roster(active_user_ids, payload.subject_id)
+
+    return {"message": "Active subject updated", "active_subject_id": payload.subject_id, "roster_size": roster_size}
+
+
 @app.post("/attendance/start")
 def start_attendance():
     print("Starting AI processing for all cameras...")
@@ -223,6 +251,7 @@ def stop_attendance():
     return {"message": "Attendance stopped"}
 
 
+# ✨ [ 2. แก้ไข Endpoint นี้ ]
 @app.get("/attendance/poll", response_model=List[dict])
 async def get_attendance_events(db: Session = Depends(get_db)):
     events = cam_mgr.get_attendance_events()
@@ -234,18 +263,36 @@ async def get_attendance_events(db: Session = Depends(get_db)):
     users_data = db.query(User.user_id, User.subject_id, User.student_code, User.name).filter(
         User.user_id.in_(user_ids_to_check)).all()
     user_info_map = {u.user_id: u for u in users_data}
+
+    # (ดึง subject_id ที่กำลัง Active จาก cam_mgr)
+    active_subject_id = cam_mgr.active_subject_id
+
     for event in events:
         user_id = event.get("user_id")
         if not user_id or user_id not in user_info_map: continue
         user_info = user_info_map[user_id]
+
+        log_subject_id: Optional[int] = None
+
+        # (Logic ใหม่ในการกำหนด Subject ID)
+        if active_subject_id is not None:
+            # 1. ถ้ามีวิชา Active (เช่น "SP405") -> บังคับ Log ให้เป็นของวิชานั้น
+            log_subject_id = active_subject_id
+        else:
+            # 2. ถ้าเลือก "All Subjects" -> ให้ใช้วิชาหลักของนักเรียน
+            log_subject_id = user_info.subject_id
+
         existing_log = db.query(AttendanceLog).filter(AttendanceLog.user_id == user_id,
                                                       AttendanceLog.action == event["action"],
                                                       func.date(AttendanceLog.timestamp) == today).first()
         if not existing_log:
             event_timestamp = datetime.fromtimestamp(event["timestamp"])
             new_log_db = AttendanceLog(
-                user_id=user_id, subject_id=user_info.subject_id, action=event["action"],
-                timestamp=event_timestamp, confidence=event.get("confidence")
+                user_id=user_id,
+                subject_id=log_subject_id,  # (ใช้ subject_id ที่เราเลือก)
+                action=event["action"],
+                timestamp=event_timestamp,
+                confidence=event.get("confidence")
             )
             db.add(new_log_db);
             db.flush()
@@ -253,7 +300,8 @@ async def get_attendance_events(db: Session = Depends(get_db)):
                 "log_id": new_log_db.log_id, "user_id": user_id,
                 "user_name": user_info.name, "student_code": user_info.student_code or "N/A",
                 "action": event["action"], "timestamp": event_timestamp.isoformat(),
-                "confidence": event.get("confidence")
+                "confidence": event.get("confidence"),
+                "subject_id": log_subject_id  # (เพิ่มการส่ง subject_id กลับไป)
             }
             new_logs_for_frontend.append(new_log_data)
     if new_logs_for_frontend: db.commit()
@@ -275,8 +323,6 @@ async def get_attendance_logs(
         .order_by(AttendanceLog.timestamp.desc())
     )
     query = query.filter(User.is_deleted == 0)
-
-    # (แก้ไข Bug 'or_' สำหรับ Subject ที่เป็น NULL)
     query = query.filter(or_(Subject.is_deleted == None, Subject.is_deleted == 0))
 
     if start_date: query = query.filter(func.date(AttendanceLog.timestamp) >= start_date)
@@ -319,8 +365,6 @@ async def export_attendance_logs(
     )
 
     query = query.filter(User.is_deleted == 0)
-
-    # (แก้ไข Bug 'or_' สำหรับ Subject ที่เป็น NULL)
     query = query.filter(or_(Subject.is_deleted == None, Subject.is_deleted == 0))
 
     if start_date: query = query.filter(func.date(AttendanceLog.timestamp) >= start_date)
@@ -370,7 +414,6 @@ async def clear_attendance_log(cam_id: str):
 # --- 7. User Management & Subject Endpoints ---
 @app.get("/subjects", response_model=List[dict])
 def list_subjects(db: Session = Depends(get_db)):
-    # (ถูกต้อง: กรองเฉพาะที่ยังไม่ลบ)
     subjects = db.query(Subject).filter(Subject.is_deleted == 0).all()
 
     return [
@@ -386,34 +429,26 @@ class SubjectCreate(BaseModel):
     schedule: Optional[str] = None
 
 
-# ✨✨✨ [ แก้ไขฟังก์ชันนี้ทั้งหมด ] ✨✨✨
 @app.post("/subjects")
 async def create_subject(
         payload: SubjectCreate,
         db: Session = Depends(get_db)
 ):
-    # Logic: "Create or Undelete"
-
-    # 1. ค้นหาวิชาด้วยชื่อและ section (ไม่ว่าสถานะจะเป็นอะไร)
     existing_subject = db.query(Subject).filter(
         Subject.subject_name == payload.subject_name,
         Subject.section == payload.section
     ).first()
 
     if existing_subject:
-        # 2. ถ้าเจอ
         if existing_subject.is_deleted == 1:
-            # 2a. ถ้ามันถูกลบไปแล้ว -> ให้กู้คืน (Undelete)
             print(f"Undeleting subject: {payload.subject_name}")
             existing_subject.is_deleted = 0
-            existing_subject.schedule = payload.schedule  # (อัปเดตข้อมูล)
+            existing_subject.schedule = payload.schedule
             new_subject = existing_subject
         else:
-            # 2b. ถ้ามันยัง Active (is_deleted = 0) -> นี่คือการสร้างซ้ำ
             print(f"Subject already active: {payload.subject_name}")
             raise HTTPException(status_code=400, detail="Subject with this name and section already exists")
     else:
-        # 3. ถ้าไม่เจอ -> สร้างใหม่ตามปกติ
         print(f"Creating new subject: {payload.subject_name}")
         new_subject = Subject(
             subject_name=payload.subject_name,
@@ -423,13 +458,11 @@ async def create_subject(
         )
         db.add(new_subject)
 
-    # 4. Commit และ Return
     try:
         db.commit()
         db.refresh(new_subject)
     except Exception as e:
         db.rollback()
-        # (ดักจับ Error จาก DB เผื่อไว้)
         raise HTTPException(status_code=500, detail=f"Database error: {e}")
 
     return {
@@ -443,7 +476,6 @@ async def create_subject(
 
 @app.delete("/subjects/{subject_id}")
 def delete_subject(subject_id: int, db: Session = Depends(get_db)):
-    # (ถูกต้อง: ค้นหาเฉพาะที่ยังไม่ลบ)
     subject = db.query(Subject).filter(
         Subject.subject_id == subject_id,
         Subject.is_deleted == 0
@@ -470,6 +502,7 @@ class UserUpdate(BaseModel):
     name: Optional[str] = None
     student_code: Optional[str] = None
     role: Optional[str] = None
+    subject_id: Optional[int] = None
 
 
 @app.post("/users")
@@ -481,8 +514,11 @@ def create_user(payload: UserCreate, db: Session = Depends(get_db)):
         if existing:
             raise HTTPException(status_code=400, detail=f"Student code '{payload.student_code}' already exists.")
     user = User(
-        student_code=payload.student_code, name=payload.name, role=payload.role,
-        user_type_id=payload.user_type_id, subject_id=payload.subject_id,
+        student_code=payload.student_code,
+        name=payload.name,
+        role=payload.role,
+        user_type_id=payload.user_type_id,
+        subject_id=payload.subject_id,
         password_hash=payload.password_hash,
     )
     db.add(user);
@@ -491,7 +527,8 @@ def create_user(payload: UserCreate, db: Session = Depends(get_db)):
     return {"message": "User created", "user": {
         "user_id": user.user_id, "student_code": user.student_code,
         "name": user.name, "role": user.role,
-        "user_type_id": user.user_type_id, "subject_id": user.subject_id
+        "user_type_id": user.user_type_id,
+        "subject_id": user.subject_id
     }}
 
 
@@ -509,7 +546,8 @@ def list_users(
         results.append({
             "user_id": u.user_id, "student_code": u.student_code,
             "name": u.name, "role": u.role,
-            "user_type_id": u.user_type_id, "subject_id": u.subject_id,
+            "user_type_id": u.user_type_id,
+            "subject_id": u.subject_id,
             "faces": [
                 {"face_id": f.face_id, "file_path": f.file_path}
                 for f in u.faces
@@ -524,9 +562,11 @@ def update_user(user_id: int, payload: UserUpdate, db: Session = Depends(get_db)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     updated = False
+
     if payload.name is not None:
         user.name = payload.name
         updated = True
+
     if payload.student_code is not None:
         if payload.student_code != user.student_code:
             existing = db.query(User).filter(User.student_code == payload.student_code, User.is_deleted == 0).first()
@@ -534,6 +574,11 @@ def update_user(user_id: int, payload: UserUpdate, db: Session = Depends(get_db)
                 raise HTTPException(status_code=400, detail=f"Student code '{payload.student_code}' already exists.")
         user.student_code = payload.student_code
         updated = True
+
+    if payload.subject_id is not None:
+        user.subject_id = payload.subject_id if payload.subject_id else None
+        updated = True
+
     if updated:
         db.commit()
     return {"message": "User updated", "user_id": user.user_id}
@@ -546,6 +591,11 @@ def delete_user(user_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="User not found")
     user.is_deleted = 1
     db.commit()
+    try:
+        train_refresh(db)
+    except Exception as e:
+        print(f"Warning: train_refresh failed after deleting user: {e}")
+
     return {"message": f"User {user_id} ({user.name}) marked as deleted."}
 
 
@@ -560,6 +610,11 @@ def delete_face(face_id: int, db: Session = Depends(get_db)):
         db.commit()
         if os.path.exists(file_path):
             os.remove(file_path)
+        try:
+            train_refresh(db)
+        except Exception as e:
+            print(f"Warning: train_refresh failed after deleting face: {e}")
+
         return {"message": f"Face image {face_id} ({face.file_path}) deleted."}
     except Exception as e:
         db.rollback()
