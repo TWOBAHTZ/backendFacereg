@@ -6,8 +6,10 @@ from pydantic import BaseModel
 from typing import Optional, List
 from sqlalchemy.orm import Session, selectinload
 from sqlalchemy.sql import func
+from sqlalchemy import or_
 import os, io, csv, asyncio, base64, time, uuid
-from datetime import datetime, date
+from datetime import datetime, date  # ✨ (มี 'date' แล้ว)
+import pandas as pd
 
 from .db_models import get_db, UserFace, User, AttendanceLog, Subject, UserType
 from .camera_handler import CameraManager, discover_local_devices
@@ -32,7 +34,7 @@ os.makedirs(COVERS_MEDIA_ROOT, exist_ok=True)
 app.mount("/static", StaticFiles(directory="data"), name="static")
 app.mount("/static/covers", StaticFiles(directory=COVERS_MEDIA_ROOT), name="static_covers")
 
-# --- 3. Camera Manager Setup (✨ [แก้ไข] ส่วนนี้) ---
+# --- 3. Camera Manager Setup ---
 print("Discovering local devices for initial setup...")
 discovered_devices = discover_local_devices(test_frame=False)
 available_sources = [d['src'] for d in discovered_devices if d.get('opened', False)]
@@ -52,8 +54,6 @@ else:
 print(f"Assigning camera sources: {CAMERA_SOURCES}")
 cam_mgr = CameraManager(CAMERA_SOURCES, fps=30, width=640, height=480)
 
-
-# --- (จบส่วนแก้ไข) ---
 
 @app.on_event("startup")
 async def _startup():
@@ -115,38 +115,27 @@ def camera_snapshot(cam_id: str):
     return Response(content=jpg, media_type="image/jpeg")
 
 
-# ✨✨✨ [ แก้ไข ENDPOINT นี้ ] ✨✨✨
 @app.get("/cameras/{cam_id}/mjpeg")
 def camera_mjpeg(cam_id: str):
-    """
-    Endpoint นี้จะเปิดกล้องเมื่อถูกเรียก และปิดกล้องเมื่อ Client หลุด
-    """
     boundary = "frame"
 
     async def gen():
         try:
-            # 1. เปิดกล้อง (ถ้ายังไม่เปิด)
             cam_mgr.open(cam_id)
             print(f"Opening MJPEG stream for {cam_id} (Source: {cam_mgr.sources[cam_id].src})")
             while True:
                 try:
-                    # 2. ดึงเฟรม
                     jpg = cam_mgr.get_jpeg(cam_id)
                     yield (
-                                b"--" + boundary.encode() + b"\r\n" + b"Content-Type: image/jpeg\r\n" + b"Cache-Control: no-cache\r\n" + b"Pragma: no-cache\r\n" + b"Content-Length: " + str(
-                            len(jpg)).encode() + b"\r\n\r\n" + jpg + b"\r\n")
+                            b"--" + boundary.encode() + b"\r\n" + b"Content-Type: image/jpeg\r\n" + b"Cache-Control: no-cache\r\n" + b"Pragma: no-cache\r\n" + b"Content-Length: " + str(
+                        len(jpg)).encode() + b"\r\n\r\n" + jpg + b"\r\n")
                 except Exception as e:
                     print(f"MJPEG gen error for {cam_id}: {e}")
-                    await asyncio.sleep(0.1)  # พักถ้าดึงเฟรมไม่ได้
-
-                # 3. Sleep ตาม FPS
+                    await asyncio.sleep(0.1)
                 await asyncio.sleep(cam_mgr.interval)
-
         except Exception as e:
             print(f"Could not open camera {cam_id} for MJPEG: {e}")
-
         finally:
-            # 4. ปิดกล้อง เมื่อ Client หลุด
             print(f"Closing MJPEG stream for {cam_id}")
             cam_mgr.close(cam_id)
 
@@ -198,23 +187,12 @@ async def ws_ai_results(ws: WebSocket, cam_id: str):
         print(f"[WS AI {cam_id}] Error: {e}")
 
 
-# ✨✨✨ [ แก้ไข ENDPOINT นี้ ] ✨✨✨
 @app.get("/cameras/discover")
 async def cameras_discover(max_index: int = 10, test_frame: bool = True):
-    """
-    สำรวจ device ที่เปิดได้ (จะไม่ไปยุ่งกับกล้องที่เปิดใช้งานอยู่)
-    """
     print("Discovering local devices...")
-    # 1. หว่ากล้องไหน (src) กำลังถูกใช้
     active_sources = [c.src for c in cam_mgr.sources.values() if c.is_open]
     print(f"Active sources (will skip test): {active_sources}")
-
-    # 2. ค้นหา โดยส่ง src ที่ใช้แล้วเข้าไป
-    devs = discover_local_devices(
-        max_index=max_index,
-        test_frame=test_frame,
-        exclude_srcs=active_sources  # (ฟังก์ชันใน handler จะข้ามการ test src พวกนี้)
-    )
+    devs = discover_local_devices(max_index=max_index, test_frame=test_frame, exclude_srcs=active_sources)
     print(f"Discovery found: {devs}")
     return {"devices": devs}
 
@@ -223,16 +201,10 @@ async def cameras_discover(max_index: int = 10, test_frame: bool = True):
 def get_camera_config(): return {"mapping": {k: v.src for k, v in cam_mgr.sources.items()}}
 
 
-# ✨✨✨ [ แก้ไข ENDPOINT นี้ ] ✨✨✨
 @app.post("/cameras/config")
 def set_camera_config(mapping: dict = Body(..., example={"entrance": "0", "exit": "1"})):
-    """
-    ตั้งค่ากล้องใหม่ (Endpoint นี้จะเป็นคน reconfigure เอง)
-    """
     print(f"Reconfiguring cameras to: {mapping}")
-    # reconfigure จะปิดกล้องเก่า และอัปเดต sources
     cam_mgr.reconfigure(mapping)
-    # (mjpeg/ws จะเรียก .open() เองเมื่อ Frontend เชื่อมต่อใหม่)
     return {"message": "camera mapping updated", "mapping": mapping}
 
 
@@ -303,6 +275,10 @@ async def get_attendance_logs(
         .order_by(AttendanceLog.timestamp.desc())
     )
     query = query.filter(User.is_deleted == 0)
+
+    # (แก้ไข Bug 'or_' สำหรับ Subject ที่เป็น NULL)
+    query = query.filter(or_(Subject.is_deleted == None, Subject.is_deleted == 0))
+
     if start_date: query = query.filter(func.date(AttendanceLog.timestamp) >= start_date)
     if end_date: query = query.filter(func.date(AttendanceLog.timestamp) <= end_date)
     if subject_id is not None: query = query.filter(AttendanceLog.subject_id == subject_id)
@@ -319,6 +295,70 @@ async def get_attendance_logs(
     return results
 
 
+@app.get("/attendance/export")
+async def export_attendance_logs(
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+        subject_id: Optional[int] = None,
+        format: str = "csv",
+        db: Session = Depends(get_db)
+):
+    query = (
+        db.query(
+            AttendanceLog.timestamp.label("Timestamp"),
+            User.student_code.label("StudentCode"),
+            User.name.label("Name"),
+            Subject.subject_name.label("Subject"),
+            Subject.section.label("Section"),
+            AttendanceLog.action.label("Action"),
+            AttendanceLog.confidence.label("Confidence")
+        )
+        .outerjoin(User, AttendanceLog.user_id == User.user_id)
+        .outerjoin(Subject, AttendanceLog.subject_id == Subject.subject_id)
+        .order_by(AttendanceLog.timestamp.asc())
+    )
+
+    query = query.filter(User.is_deleted == 0)
+
+    # (แก้ไข Bug 'or_' สำหรับ Subject ที่เป็น NULL)
+    query = query.filter(or_(Subject.is_deleted == None, Subject.is_deleted == 0))
+
+    if start_date: query = query.filter(func.date(AttendanceLog.timestamp) >= start_date)
+    if end_date: query = query.filter(func.date(AttendanceLog.timestamp) <= end_date)
+    if subject_id is not None: query = query.filter(AttendanceLog.subject_id == subject_id)
+
+    logs = query.all()
+
+    if not logs:
+        df = pd.DataFrame(columns=["Timestamp", "StudentCode", "Name", "Subject", "Section", "Action", "Confidence"])
+        df.loc[0] = ["No data found for the selected filters."] + [""] * 6
+    else:
+        df = pd.DataFrame([log._asdict() for log in logs])
+        if 'Timestamp' in df.columns:
+            df['Timestamp'] = pd.to_datetime(df['Timestamp']).dt.tz_localize(None)
+
+    output = io.BytesIO()
+    filename = f"attendance_export_{start_date or 'all'}_to_{end_date or 'all'}"
+
+    if format.lower() == 'xlsx':
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            df.to_excel(writer, index=False, sheet_name='Attendance')
+        media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        filename += ".xlsx"
+    else:
+        df.to_csv(output, index=False, encoding='utf-8')
+        media_type = "text/csv"
+        filename += ".csv"
+
+    return Response(
+        content=output.getvalue(),
+        media_type=media_type,
+        headers={
+            "Content-Disposition": f"attachment; filename={filename}"
+        }
+    )
+
+
 @app.post("/attendance/clear/{cam_id}")
 async def clear_attendance_log(cam_id: str):
     if cam_mgr.clear_attendance_session(cam_id):
@@ -330,45 +370,91 @@ async def clear_attendance_log(cam_id: str):
 # --- 7. User Management & Subject Endpoints ---
 @app.get("/subjects", response_model=List[dict])
 def list_subjects(db: Session = Depends(get_db)):
-    subjects = db.query(Subject).all()
+    # (ถูกต้อง: กรองเฉพาะที่ยังไม่ลบ)
+    subjects = db.query(Subject).filter(Subject.is_deleted == 0).all()
+
     return [
         {"subject_id": s.subject_id, "subject_name": s.subject_name, "section": s.section,
-         "cover_image_path": s.cover_image_path}
+         "cover_image_path": s.cover_image_path, "schedule": s.schedule}
         for s in subjects
     ]
 
 
+class SubjectCreate(BaseModel):
+    subject_name: str
+    section: Optional[str] = None
+    schedule: Optional[str] = None
+
+
+# ✨✨✨ [ แก้ไขฟังก์ชันนี้ทั้งหมด ] ✨✨✨
 @app.post("/subjects")
 async def create_subject(
-        subject_name: str = Form(...),
-        section: Optional[str] = Form(None),
-        cover_image: Optional[UploadFile] = File(None),
+        payload: SubjectCreate,
         db: Session = Depends(get_db)
 ):
-    existing = db.query(Subject).filter(Subject.subject_name == subject_name, Subject.section == section).first()
-    if existing:
-        raise HTTPException(status_code=400, detail="Subject with this name and section already exists")
-    image_path = None
-    if cover_image:
-        file_ext = os.path.splitext(cover_image.filename)[1]
-        name = f"{uuid.uuid4()}{file_ext}"
-        dest = os.path.join(COVERS_MEDIA_ROOT, name)
-        with open(dest, "wb") as wf: wf.write(await cover_image.read())
-        image_path = name
-    new_subject = Subject(
-        subject_name=subject_name,
-        section=section,
-        cover_image_path=image_path
-    )
-    db.add(new_subject);
-    db.commit();
-    db.refresh(new_subject)
+    # Logic: "Create or Undelete"
+
+    # 1. ค้นหาวิชาด้วยชื่อและ section (ไม่ว่าสถานะจะเป็นอะไร)
+    existing_subject = db.query(Subject).filter(
+        Subject.subject_name == payload.subject_name,
+        Subject.section == payload.section
+    ).first()
+
+    if existing_subject:
+        # 2. ถ้าเจอ
+        if existing_subject.is_deleted == 1:
+            # 2a. ถ้ามันถูกลบไปแล้ว -> ให้กู้คืน (Undelete)
+            print(f"Undeleting subject: {payload.subject_name}")
+            existing_subject.is_deleted = 0
+            existing_subject.schedule = payload.schedule  # (อัปเดตข้อมูล)
+            new_subject = existing_subject
+        else:
+            # 2b. ถ้ามันยัง Active (is_deleted = 0) -> นี่คือการสร้างซ้ำ
+            print(f"Subject already active: {payload.subject_name}")
+            raise HTTPException(status_code=400, detail="Subject with this name and section already exists")
+    else:
+        # 3. ถ้าไม่เจอ -> สร้างใหม่ตามปกติ
+        print(f"Creating new subject: {payload.subject_name}")
+        new_subject = Subject(
+            subject_name=payload.subject_name,
+            section=payload.section,
+            schedule=payload.schedule,
+            is_deleted=0
+        )
+        db.add(new_subject)
+
+    # 4. Commit และ Return
+    try:
+        db.commit()
+        db.refresh(new_subject)
+    except Exception as e:
+        db.rollback()
+        # (ดักจับ Error จาก DB เผื่อไว้)
+        raise HTTPException(status_code=500, detail=f"Database error: {e}")
+
     return {
         "subject_id": new_subject.subject_id,
         "subject_name": new_subject.subject_name,
         "section": new_subject.section,
+        "schedule": new_subject.schedule,
         "cover_image_path": new_subject.cover_image_path
     }
+
+
+@app.delete("/subjects/{subject_id}")
+def delete_subject(subject_id: int, db: Session = Depends(get_db)):
+    # (ถูกต้อง: ค้นหาเฉพาะที่ยังไม่ลบ)
+    subject = db.query(Subject).filter(
+        Subject.subject_id == subject_id,
+        Subject.is_deleted == 0
+    ).first()
+
+    if not subject:
+        raise HTTPException(status_code=404, detail="Subject not found")
+
+    subject.is_deleted = 1
+    db.commit()
+    return {"message": f"Subject {subject_id} ({subject.subject_name}) marked as deleted."}
 
 
 class UserCreate(BaseModel):

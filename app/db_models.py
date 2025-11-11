@@ -61,6 +61,7 @@ class UserType(Base):
 class Subject(Base):
     __tablename__ = "subjects"
     __table_args__ = (
+        # ✨ [ แก้ไข ] : กลับไปใช้กฏเดิมที่ถูกต้อง
         UniqueConstraint("subject_name", "section", name="uq_subject"),
     )
 
@@ -68,6 +69,8 @@ class Subject(Base):
     subject_name: Mapped[str]  = mapped_column(String(255), nullable=False)
     section:      Mapped[Optional[str]] = mapped_column(String(100), default=None)
     schedule:     Mapped[Optional[str]] = mapped_column(String(255), default=None)
+    cover_image_path: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    is_deleted:   Mapped[int]  = mapped_column(Integer, default=0, nullable=False)
 
     # relationships
     users: Mapped[List["User"]] = relationship(back_populates="subject")
