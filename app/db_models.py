@@ -35,7 +35,7 @@ class Base(DeclarativeBase):
 
 engine = create_engine(
     settings.db_url,
-    echo=False,          # ตั้ง True ตอน debug ได้
+    echo=False,
     future=True,
     pool_pre_ping=True,
 )

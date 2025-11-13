@@ -251,7 +251,7 @@ def stop_attendance():
     return {"message": "Attendance stopped"}
 
 
-# ✨ [ 2. แก้ไข Endpoint นี้ ]
+
 @app.get("/attendance/poll", response_model=List[dict])
 async def get_attendance_events(db: Session = Depends(get_db)):
     events = cam_mgr.get_attendance_events()

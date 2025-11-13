@@ -114,7 +114,6 @@ def _best_match(emb: np.ndarray) -> Tuple[Optional[int], float]:
     return best_uid, float(best_sim)
 
 
-# ✨✨✨ --- นี่คือฟังก์ชันที่แก้ไข --- ✨✨✨
 def annotate_and_match(frame: np.ndarray) -> List[Dict[str, Any]]:
     """
     ค้นหาใบหน้า, เปรียบเทียบ, และคืนค่าเป็น List[dict] ของข้อมูล
@@ -140,7 +139,7 @@ def annotate_and_match(frame: np.ndarray) -> List[Dict[str, Any]]:
             name = "Unknown"
             display_name = "Unknown"
             matched = False
-            uid = None  # ✨ (สำคัญ) ต้องมั่นใจว่า uid เป็น None ถ้าไม่ Match
+            uid = None
 
         w = x2 - x1
         h = y2 - y1
@@ -151,9 +150,8 @@ def annotate_and_match(frame: np.ndarray) -> List[Dict[str, Any]]:
             "similarity": float(sim) if sim is not None else None,
             "matched": matched,
             "display_name": display_name,
-            "user_id": uid  # ✨✨✨ เพิ่มบรรทัดนี้ ✨✨✨
+            "user_id": uid
         }
         results.append(result_data)
 
     return results
-# ✨✨✨ --- จบฟังก์ชันที่แก้ไข --- ✨✨✨
