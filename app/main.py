@@ -14,6 +14,12 @@ from collections import defaultdict
 
 import pandas as pd
 
+# --- [ 1. เพิ่ม IMPORTS เหล่านี้ ] ---
+from openpyxl import Workbook
+from openpyxl.drawing.image import Image as OpenPyXLImage
+from PIL import Image as PILImage
+# ---------------------------------
+
 from .db_models import get_db, UserFace, User, AttendanceLog, Subject, UserType
 from .camera_handler import CameraManager, discover_local_devices
 from .ai_engine import refresh_facebank_from_db, load_facebank
@@ -387,6 +393,7 @@ async def get_attendance_logs(
     return results
 
 
+# --- [ ⭐️⭐️⭐️ นี่คือฟังก์ชันที่แก้ไข ⭐️⭐️⭐️ ] ---
 @app.get("/attendance/export")
 async def export_attendance_logs(
         start_date: Optional[date] = None,
@@ -403,7 +410,9 @@ async def export_attendance_logs(
             Subject.subject_name.label("Subject"),
             Subject.section.label("Section"),
             AttendanceLog.action.label("Action"),
-            AttendanceLog.confidence.label("Confidence")
+            AttendanceLog.confidence.label("Confidence"),
+            # --- [ 2. เพิ่มคอลัมน์นี้ใน QUERY ] ---
+            AttendanceLog.snapshot_path.label("SnapshotPath")
         )
         .outerjoin(User, AttendanceLog.user_id == User.user_id)
         .outerjoin(Subject, AttendanceLog.subject_id == Subject.subject_id)
@@ -414,25 +423,121 @@ async def export_attendance_logs(
     if start_date: query = query.filter(func.date(AttendanceLog.timestamp) >= start_date)
     if end_date: query = query.filter(func.date(AttendanceLog.timestamp) <= end_date)
     if subject_id is not None: query = query.filter(AttendanceLog.subject_id == subject_id)
+
     logs = query.all()
-    if not logs:
-        df = pd.DataFrame(columns=["Timestamp", "StudentCode", "Name", "Subject", "Section", "Action", "Confidence"])
-        df.loc[0] = ["No data found for the selected filters."] + [""] * 6
-    else:
-        df = pd.DataFrame([log._asdict() for log in logs])
-        if 'Timestamp' in df.columns:
-            df['Timestamp'] = pd.to_datetime(df['Timestamp']).dt.tz_localize(None)
+
     output = io.BytesIO()
     filename = f"attendance_export_{start_date or 'all'}_to_{end_date or 'all'}"
+
     if format.lower() == 'xlsx':
-        with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            df.to_excel(writer, index=False, sheet_name='Attendance')
+        # --- [ 3. นี่คือ BLOCK ที่แทนที่ของเดิม ] ---
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Attendance"
+
+        # 3.1 สร้าง Headers
+        headers = ["Timestamp", "StudentCode", "Name", "Subject", "Section", "Action", "Confidence", "Snapshot"]
+        ws.append(headers)
+
+        # 3.2 ปรับความกว้างคอลัมน์ (เลือกได้)
+        ws.column_dimensions['A'].width = 22  # Timestamp
+        ws.column_dimensions['B'].width = 15  # StudentCode
+        ws.column_dimensions['C'].width = 25  # Name
+        ws.column_dimensions['D'].width = 20  # Subject
+        ws.column_dimensions['E'].width = 10  # Section
+        ws.column_dimensions['F'].width = 10  # Action
+        ws.column_dimensions['G'].width = 12  # Confidence
+        ws.column_dimensions['H'].width = 20  # Snapshot (กว้าง)
+
+        if not logs:
+            ws.append(["No data found for the selected filters."] + [""] * 7)
+        else:
+            # 3.3 วนลูปข้อมูลและเพิ่มลงใน Excel
+            for idx, log in enumerate(logs):
+                row_num = idx + 2  # (1-based index, +1 สำหรับ header)
+
+                # Format timestamp (เพื่อให้เหมือนกับที่ pandas เคยทำ)
+                timestamp_str = pd.to_datetime(log.Timestamp).tz_localize(None).strftime('%Y-%m-%d %H:%M:%S')
+
+                # เพิ่มข้อมูลตัวอักษร
+                ws.append([
+                    timestamp_str,
+                    log.StudentCode,
+                    log.Name,
+                    log.Subject,
+                    log.Section,
+                    log.Action,
+                    log.Confidence,
+                    ""  # เว้นไว้สำหรับรูปภาพ
+                ])
+
+                # 3.4 ปรับความสูงของแถว
+                ws.row_dimensions[row_num].height = 65  # (ประมาณ 80px)
+
+                # 3.5 (ส่วนสำคัญ) เพิ่มรูปภาพ
+                if log.SnapshotPath and os.path.exists(log.SnapshotPath):
+                    try:
+                        # ใช้ Pillow เปิดและย่อขนาด
+                        pil_img = PILImage.open(log.SnapshotPath)
+
+                        # ย่อขนาด (กำหนดความสูง 80px, ความกว้างอัตโนมัติ)
+                        target_height = 80
+                        width_percent = (target_height / float(pil_img.size[1]))
+                        target_width = int((float(pil_img.size[0]) * float(width_percent)))
+
+                        pil_img = pil_img.resize((target_width, target_height), PILImage.LANCZOS)
+
+                        # เซฟลง memory ชั่วคราว
+                        img_io = io.BytesIO()
+                        pil_img.save(img_io, format='PNG')
+                        img_io.seek(0)
+
+                        img_for_excel = OpenPyXLImage(img_io)
+
+                        # แปะรูปลงใน Cell
+                        ws.add_image(img_for_excel, f"H{row_num}")
+
+                    except Exception as e:
+                        print(f"Error processing image {log.SnapshotPath}: {e}")
+                        ws[f"H{row_num}"] = "Error: Img"
+                else:
+                    ws[f"H{row_num}"] = "N/A"
+
+        # 3.6 เซฟ Workbook ลงใน output
+        wb.save(output)
+
+        # --- [ สิ้นสุดการแทนที่ ] ---
+
         media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         filename += ".xlsx"
-    else:
+
+    else:  # (format.lower() == 'csv')
+        # --- [ 4. นี่คือ ELSE BLOCK ที่แทนที่ของเดิม ] ---
+
+        if not logs:
+            df = pd.DataFrame(columns=["Timestamp", "StudentCode", "Name", "Subject", "Section", "Action", "Confidence",
+                                       "SnapshotPath"])
+            df.loc[0] = ["No data found for the selected filters."] + [""] * 7
+        else:
+            # แปลง logs (SQLAlchemy Row) เป็น list of dicts
+            log_dicts = [log._asdict() for log in logs]
+            df = pd.DataFrame(log_dicts)
+
+            # จัดเรียงคอลัมน์ (CSV จะมี Path ของรูปแทน)
+            cols_in_order = ["Timestamp", "StudentCode", "Name", "Subject", "Section", "Action", "Confidence",
+                             "SnapshotPath"]
+            df = df[cols_in_order]
+
+            if 'Timestamp' in df.columns:
+                df['Timestamp'] = pd.to_datetime(df['Timestamp']).dt.tz_localize(None)
+
         df.to_csv(output, index=False, encoding='utf-8')
+        # --- [ สิ้นสุดการแทนที่ ] ---
+
         media_type = "text/csv"
         filename += ".csv"
+
     return Response(
         content=output.getvalue(),
         media_type=media_type,
@@ -440,6 +545,9 @@ async def export_attendance_logs(
             "Content-Disposition": f"attachment; filename={filename}"
         }
     )
+
+
+# --- [ ⭐️⭐️⭐️ สิ้นสุดฟังก์ชันที่แก้ไข ⭐️⭐️⭐️ ] ---
 
 
 @app.post("/attendance/clear/{cam_id}")
@@ -558,7 +666,7 @@ class SubjectTimeUpdate(BaseModel):
 def update_subject_time(subject_id: int, payload: SubjectTimeUpdate, db: Session = Depends(get_db)):
     subject = db.query(Subject).filter(Subject.subject_id == subject_id).first()
     if not subject:
-        raise HTTPException(status_code=404, detail="Subject not found")
+        raise HTTPException(status_code=44, detail="Subject not found")
 
     try:
         subject.class_start_time = payload.class_start_time
@@ -941,7 +1049,7 @@ def get_session_view(subjectId: str, date: date, db: Session = Depends(get_db)):
             AttendanceLog.timestamp.between(start_of_day, end_of_day)).group_by(AttendanceLog.user_id).subquery())
     first_logs_today = (db.query(AttendanceLog).join(first_log_subquery,
                                                      (AttendanceLog.user_id == first_log_subquery.c.user_id) & (
-                                                                 AttendanceLog.timestamp == first_log_subquery.c.first_timestamp)).all())
+                                                             AttendanceLog.timestamp == first_log_subquery.c.first_timestamp)).all())
     logs_map = {log.user_id: log for log in first_logs_today}
 
     live_data_table: List[ILiveDataEntry] = [];
@@ -953,7 +1061,8 @@ def get_session_view(subjectId: str, date: date, db: Session = Depends(get_db)):
         if log:
             status = "Present";
             if log.timestamp > CLASS_START_DATETIME:
-                status = "Late"; kpi_late += 1
+                status = "Late";
+                kpi_late += 1
             else:
                 kpi_present_on_time += 1
             live_data_table.append(
