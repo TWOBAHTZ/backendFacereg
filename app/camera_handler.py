@@ -50,6 +50,10 @@ class CameraManager:
         self.checked_in_session: Dict[str, Set[str]] = {}
         self.check_in_queue = queue.Queue()
 
+        # ✨ [ 1. เพิ่ม 2 บรรทัดนี้ ] (นี่คือจุดที่ไฟล์เก่าของคุณขาดไป)
+        self.active_roster: Optional[Set[int]] = None
+        self.active_subject_id: Optional[int] = None
+
     def _open_cap(self, src: str) -> cv2.VideoCapture:
         backend = _backend_flag()
         if src.isdigit():
@@ -201,6 +205,12 @@ class CameraManager:
                         name = res.get("name")
                         user_id = res.get("user_id")
                         if name == "Unknown" or not user_id: continue
+
+                        # (Logic ตรวจสอบ Roster)
+                        if self.active_roster is not None and user_id not in self.active_roster:
+                            res["display_name"] = f"{name} (Not in class)"
+                            continue
+
                         seen_in_frame.add(name)
                         if name in checked_in: continue
 
@@ -214,7 +224,7 @@ class CameraManager:
                                     "user_id": user_id, "name": name,
                                     "action": current_action, "timestamp": current_time,
                                     "confidence": res.get("similarity"),
-                                    "frame": frame  # (โค้ดนี้ถูกต้องแล้ว)
+                                    "frame": frame
                                 }
                                 self.check_in_queue.put(check_in_data)
                                 print(f"✅ [ATTENDANCE] Checked in: {name} (Action: {current_action})")
@@ -271,12 +281,7 @@ class CameraManager:
 
         print(f"Reconfigure complete. Current sources: {self.sources}")
 
-    # ✨ [แก้ไข] เพิ่มฟังก์ชันนี้เข้ามา
     def reset_user_session(self, user_name: str):
-        """
-        ลบ user ออกจาก 'checked_in_session' ของกล้อง *ทั้งหมด*
-        เพื่อให้ user นี้สามารถ check-in (enter) ใหม่ได้
-        """
         print(f"[Session] Resetting session for user: {user_name}")
         for cam_id, session_set in self.checked_in_session.items():
             if user_name in session_set:
@@ -284,8 +289,9 @@ class CameraManager:
                     session_set.remove(user_name)
                     print(f"[Session] Removed {user_name} from {cam_id} session.")
                 except KeyError:
-                    pass  # (อาจจะเกิด Race Condition แต่ไม่เป็นไร)
+                    pass
 
+    # ✨ [ 2. แก้ไขฟังก์ชันนี้ ] (นี่คือจุดที่ไฟล์เก่าของคุณขาดไป)
     def set_active_roster(self, user_ids: Optional[Set[int]], subject_id: Optional[int]):
         """
         อัปเดต Roster (บัญชีรายชื่อ) และ Subject ID ที่กำลัง Active
@@ -321,7 +327,6 @@ class CameraManager:
         return None
 
 
-# (ฟังก์ชัน discover_local_devices อยู่นอก Class ถูกต้องแล้ว)
 def discover_local_devices(
         max_index: int = 10,
         test_frame: bool = True,
