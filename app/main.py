@@ -1,4 +1,3 @@
-# app/main.py
 import cv2
 from fastapi import FastAPI, UploadFile, File, Form, WebSocket, WebSocketDisconnect, Depends, HTTPException, Response, \
     Body
@@ -14,11 +13,9 @@ from collections import defaultdict
 
 import pandas as pd
 
-# --- [ 1. เพิ่ม IMPORTS เหล่านี้ ] ---
 from openpyxl import Workbook
 from openpyxl.drawing.image import Image as OpenPyXLImage
 from PIL import Image as PILImage
-# ---------------------------------
 
 from .db_models import get_db, UserFace, User, AttendanceLog, Subject, UserType
 from .camera_handler import CameraManager, discover_local_devices
@@ -231,7 +228,7 @@ def set_camera_config(mapping: dict = Body(..., example={"entrance": "0", "exit"
     return {"message": "camera mapping updated", "mapping": mapping}
 
 
-# --- 6. Attendance API Endpoints (เหมือนเดิม) ---
+# --- 6. Attendance API Endpoints ---
 class ActiveSubjectPayload(BaseModel):
     subject_id: Optional[int] = None
 
@@ -294,29 +291,45 @@ async def get_attendance_events(db: Session = Depends(get_db)):
             log_subject_id = user_info.subject_id
 
         event_timestamp = datetime.fromtimestamp(event["timestamp"])
+
+        # ✨ --- [แก้ไข Logic การตรวจสอบ Log ซ้ำ] --- ✨
+
+        # 1. ค้นหา Log ล่าสุดของ User นี้ (ไม่จำกัด action)
         last_log = db.query(AttendanceLog).filter(
             AttendanceLog.user_id == user_id
         ).order_by(AttendanceLog.timestamp.desc()).first()
 
+        # 2. ตรวจสอบเงื่อนไขการบันทึก
         can_log = False
         time_since_last_log = timedelta(days=1)
         if last_log:
             time_since_last_log = event_timestamp - last_log.timestamp
 
+        current_event_action = event["action"].lower()
+
         if not last_log:
-            if event["action"].lower() == "enter":
+            # (A) ไม่เคยมี Log มาก่อน: (ต้องเป็น 'enter' เท่านั้น)
+            if current_event_action == "enter":
                 can_log = True
-        elif event["action"].lower() == "enter":
+
+        elif current_event_action == "enter":
+            # (B) ถ้า Event เป็น 'enter':
             if last_log.action.lower() == "exit":
+                # ถ้า Log ล่าสุดคือ "exit", ให้รอ 30 วินาที
                 if time_since_last_log >= timedelta(seconds=COOLDOWN_SECONDS):
                     can_log = True
             elif last_log.action.lower() == "enter":
+                # (กัน spam 'enter')
                 if time_since_last_log >= timedelta(seconds=COOLDOWN_SECONDS):
                     can_log = True
-        elif event["action"].lower() == "exit":
+
+        elif current_event_action == "exit":
+            # (C) ถ้า Event เป็น 'exit':
             if last_log.action.lower() == "enter":
+                # ถ้า Log ล่าสุดคือ "enter", อนุญาตให้ออกทันที (ไม่ Cooldown)
                 can_log = True
             elif last_log.action.lower() == "exit":
+                # (กัน spam 'exit')
                 if time_since_last_log >= timedelta(seconds=COOLDOWN_SECONDS):
                     can_log = True
 
@@ -393,7 +406,6 @@ async def get_attendance_logs(
     return results
 
 
-# --- [ ⭐️⭐️⭐️ นี่คือฟังก์ชันที่แก้ไข ⭐️⭐️⭐️ ] ---
 @app.get("/attendance/export")
 async def export_attendance_logs(
         start_date: Optional[date] = None,
@@ -411,7 +423,6 @@ async def export_attendance_logs(
             Subject.section.label("Section"),
             AttendanceLog.action.label("Action"),
             AttendanceLog.confidence.label("Confidence"),
-            # --- [ 2. เพิ่มคอลัมน์นี้ใน QUERY ] ---
             AttendanceLog.snapshot_path.label("SnapshotPath")
         )
         .outerjoin(User, AttendanceLog.user_id == User.user_id)
@@ -419,7 +430,6 @@ async def export_attendance_logs(
         .order_by(AttendanceLog.timestamp.asc())
     )
     query = query.filter(User.is_deleted == 0)
-    query = query.filter(or_(Subject.is_deleted == None, Subject.is_deleted == 0))
     if start_date: query = query.filter(func.date(AttendanceLog.timestamp) >= start_date)
     if end_date: query = query.filter(func.date(AttendanceLog.timestamp) <= end_date)
     if subject_id is not None: query = query.filter(AttendanceLog.subject_id == subject_id)
@@ -430,124 +440,72 @@ async def export_attendance_logs(
     filename = f"attendance_export_{start_date or 'all'}_to_{end_date or 'all'}"
 
     if format.lower() == 'xlsx':
-        # --- [ 3. นี่คือ BLOCK ที่แทนที่ของเดิม ] ---
-
         wb = Workbook()
         ws = wb.active
         ws.title = "Attendance"
-
-        # 3.1 สร้าง Headers
         headers = ["Timestamp", "StudentCode", "Name", "Subject", "Section", "Action", "Confidence", "Snapshot"]
         ws.append(headers)
-
-        # 3.2 ปรับความกว้างคอลัมน์ (เลือกได้)
-        ws.column_dimensions['A'].width = 22  # Timestamp
-        ws.column_dimensions['B'].width = 15  # StudentCode
-        ws.column_dimensions['C'].width = 25  # Name
-        ws.column_dimensions['D'].width = 20  # Subject
-        ws.column_dimensions['E'].width = 10  # Section
-        ws.column_dimensions['F'].width = 10  # Action
-        ws.column_dimensions['G'].width = 12  # Confidence
-        ws.column_dimensions['H'].width = 20  # Snapshot (กว้าง)
-
+        ws.column_dimensions['A'].width = 22
+        ws.column_dimensions['B'].width = 15
+        ws.column_dimensions['C'].width = 25
+        ws.column_dimensions['D'].width = 20
+        ws.column_dimensions['E'].width = 10
+        ws.column_dimensions['F'].width = 10
+        ws.column_dimensions['G'].width = 12
+        ws.column_dimensions['H'].width = 20
         if not logs:
             ws.append(["No data found for the selected filters."] + [""] * 7)
         else:
-            # 3.3 วนลูปข้อมูลและเพิ่มลงใน Excel
             for idx, log in enumerate(logs):
-                row_num = idx + 2  # (1-based index, +1 สำหรับ header)
-
-                # Format timestamp (เพื่อให้เหมือนกับที่ pandas เคยทำ)
+                row_num = idx + 2
                 timestamp_str = pd.to_datetime(log.Timestamp).tz_localize(None).strftime('%Y-%m-%d %H:%M:%S')
-
-                # เพิ่มข้อมูลตัวอักษร
                 ws.append([
-                    timestamp_str,
-                    log.StudentCode,
-                    log.Name,
-                    log.Subject,
-                    log.Section,
-                    log.Action,
-                    log.Confidence,
-                    ""  # เว้นไว้สำหรับรูปภาพ
+                    timestamp_str, log.StudentCode, log.Name, log.Subject,
+                    log.Section, log.Action, log.Confidence, ""
                 ])
-
-                # 3.4 ปรับความสูงของแถว
-                ws.row_dimensions[row_num].height = 65  # (ประมาณ 80px)
-
-                # 3.5 (ส่วนสำคัญ) เพิ่มรูปภาพ
+                ws.row_dimensions[row_num].height = 65
                 if log.SnapshotPath and os.path.exists(log.SnapshotPath):
                     try:
-                        # ใช้ Pillow เปิดและย่อขนาด
                         pil_img = PILImage.open(log.SnapshotPath)
-
-                        # ย่อขนาด (กำหนดความสูง 80px, ความกว้างอัตโนมัติ)
                         target_height = 80
                         width_percent = (target_height / float(pil_img.size[1]))
                         target_width = int((float(pil_img.size[0]) * float(width_percent)))
-
                         pil_img = pil_img.resize((target_width, target_height), PILImage.LANCZOS)
-
-                        # เซฟลง memory ชั่วคราว
                         img_io = io.BytesIO()
                         pil_img.save(img_io, format='PNG')
                         img_io.seek(0)
-
                         img_for_excel = OpenPyXLImage(img_io)
-
-                        # แปะรูปลงใน Cell
                         ws.add_image(img_for_excel, f"H{row_num}")
-
                     except Exception as e:
                         print(f"Error processing image {log.SnapshotPath}: {e}")
                         ws[f"H{row_num}"] = "Error: Img"
                 else:
                     ws[f"H{row_num}"] = "N/A"
-
-        # 3.6 เซฟ Workbook ลงใน output
         wb.save(output)
-
-        # --- [ สิ้นสุดการแทนที่ ] ---
-
         media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         filename += ".xlsx"
 
-    else:  # (format.lower() == 'csv')
-        # --- [ 4. นี่คือ ELSE BLOCK ที่แทนที่ของเดิม ] ---
-
+    else:
         if not logs:
             df = pd.DataFrame(columns=["Timestamp", "StudentCode", "Name", "Subject", "Section", "Action", "Confidence",
                                        "SnapshotPath"])
             df.loc[0] = ["No data found for the selected filters."] + [""] * 7
         else:
-            # แปลง logs (SQLAlchemy Row) เป็น list of dicts
             log_dicts = [log._asdict() for log in logs]
             df = pd.DataFrame(log_dicts)
-
-            # จัดเรียงคอลัมน์ (CSV จะมี Path ของรูปแทน)
             cols_in_order = ["Timestamp", "StudentCode", "Name", "Subject", "Section", "Action", "Confidence",
                              "SnapshotPath"]
             df = df[cols_in_order]
-
             if 'Timestamp' in df.columns:
                 df['Timestamp'] = pd.to_datetime(df['Timestamp']).dt.tz_localize(None)
-
         df.to_csv(output, index=False, encoding='utf-8')
-        # --- [ สิ้นสุดการแทนที่ ] ---
-
         media_type = "text/csv"
         filename += ".csv"
 
     return Response(
-        content=output.getvalue(),
-        media_type=media_type,
-        headers={
-            "Content-Disposition": f"attachment; filename={filename}"
-        }
+        content=output.getvalue(), media_type=media_type,
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
     )
-
-
-# --- [ ⭐️⭐️⭐️ สิ้นสุดฟังก์ชันที่แก้ไข ⭐️⭐️⭐️ ] ---
 
 
 @app.post("/attendance/clear/{cam_id}")
@@ -558,20 +516,7 @@ async def clear_attendance_log(cam_id: str):
         raise HTTPException(status_code=404, detail=f"Camera {cam_id} not found or not open.")
 
 
-# --- 7. User Management & Subject Endpoints (เหมือนเดิม) ---
-@app.get("/subjects", response_model=List[dict])
-def list_subjects(db: Session = Depends(get_db)):
-    subjects = db.query(Subject).filter(Subject.is_deleted == 0).all()
-    return [
-        {"subject_id": s.subject_id, "subject_name": s.subject_name, "section": s.section,
-         "cover_image_path": s.cover_image_path, "schedule": s.schedule,
-         "academic_year": s.academic_year,
-         "class_start_time": s.class_start_time.isoformat() if s.class_start_time else None,
-         "class_end_time": s.class_end_time.isoformat() if s.class_end_time else None,
-         }
-        for s in subjects
-    ]
-
+# --- 7. User Management & Subject Endpoints ---
 
 class SubjectCreate(BaseModel):
     subject_name: str
@@ -582,7 +527,42 @@ class SubjectCreate(BaseModel):
     class_end_time: Optional[dt_time] = None
 
 
-@app.post("/subjects", response_model=dict)
+class SubjectResponse(BaseModel):
+    subject_id: int
+    subject_name: str
+    section: Optional[str] = None
+    schedule: Optional[str] = None
+    academic_year: Optional[str] = None
+    class_start_time: Optional[dt_time] = None
+    class_end_time: Optional[dt_time] = None
+
+    class Config:
+        from_attributes = True
+
+
+class UserCreate(BaseModel):
+    student_code: Optional[str] = None
+    name: str;
+    role: str
+    user_type_id: Optional[int] = None
+    subject_id: Optional[int] = None
+    password_hash: Optional[str] = None
+
+
+class UserUpdate(BaseModel):
+    name: Optional[str] = None
+    student_code: Optional[str] = None
+    role: Optional[str] = None
+    subject_id: Optional[int] = None
+
+
+@app.get("/subjects", response_model=List[SubjectResponse])
+def list_subjects(db: Session = Depends(get_db)):
+    subjects = db.query(Subject).all()
+    return subjects
+
+
+@app.post("/subjects", response_model=SubjectResponse)
 async def create_subject(
         payload: SubjectCreate,
         db: Session = Depends(get_db)
@@ -594,17 +574,7 @@ async def create_subject(
     ).first()
 
     if existing_subject:
-        if existing_subject.is_deleted == 1:
-            print(f"Undeleting subject: {payload.subject_name}")
-            existing_subject.is_deleted = 0
-            existing_subject.schedule = payload.schedule
-            existing_subject.academic_year = payload.academic_year
-            existing_subject.class_start_time = payload.class_start_time
-            existing_subject.class_end_time = payload.class_end_time
-            new_subject = existing_subject
-        else:
-            print(f"Subject already active: {payload.subject_name}")
-            raise HTTPException(status_code=400, detail="Subject with this name/section/year already exists")
+        raise HTTPException(status_code=400, detail="Subject with this name/section/year already exists")
     else:
         print(f"Creating new subject: {payload.subject_name}")
         new_subject = Subject(
@@ -614,7 +584,6 @@ async def create_subject(
             academic_year=payload.academic_year,
             class_start_time=payload.class_start_time,
             class_end_time=payload.class_end_time,
-            is_deleted=0
         )
         db.add(new_subject)
     try:
@@ -624,29 +593,32 @@ async def create_subject(
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Database error: {e}")
 
-    return {
-        "subject_id": new_subject.subject_id,
-        "subject_name": new_subject.subject_name,
-        "section": new_subject.section,
-        "schedule": new_subject.schedule,
-        "cover_image_path": new_subject.cover_image_path,
-        "academic_year": new_subject.academic_year,
-        "class_start_time": new_subject.class_start_time,
-        "class_end_time": new_subject.class_end_time,
-    }
+    return new_subject
 
 
 @app.delete("/subjects/{subject_id}")
 def delete_subject(subject_id: int, db: Session = Depends(get_db)):
     subject = db.query(Subject).filter(
-        Subject.subject_id == subject_id,
-        Subject.is_deleted == 0
+        Subject.subject_id == subject_id
     ).first()
+
     if not subject:
         raise HTTPException(status_code=404, detail="Subject not found")
-    subject.is_deleted = 1
-    db.commit()
-    return {"message": f"Subject {subject_id} ({subject.subject_name}) marked as deleted."}
+
+    student_count = db.query(User).filter(User.subject_id == subject_id, User.is_deleted == 0).count()
+    if student_count > 0:
+        raise HTTPException(status_code=400,
+                            detail=f"Cannot delete subject. {student_count} student(s) are still enrolled.")
+
+    try:
+        db.query(AttendanceLog).filter(AttendanceLog.subject_id == subject_id).delete()
+        db.delete(subject)
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to delete subject: {e}")
+
+    return {"message": f"Subject {subject_id} ({subject.subject_name}) permanently deleted."}
 
 
 @app.get("/subjects/{subject_id}/student_count", response_model=dict)
@@ -673,27 +645,11 @@ def update_subject_time(subject_id: int, payload: SubjectTimeUpdate, db: Session
         db.commit()
         print(f"Updated start time for subject {subject_id} to {payload.class_start_time}")
         return {"message": "Subject time updated successfully", "subject_id": subject_id,
-                "new_time": payload.class_start_time}
+                "new_time": payload.class_start_time.isoformat() if payload.class_start_time else None}
     except Exception as e:
         db.rollback()
         print(f"Error updating subject time: {e}")
         raise HTTPException(status_code=500, detail=f"Database error: {e}")
-
-
-class UserCreate(BaseModel):
-    student_code: Optional[str] = None
-    name: str;
-    role: str
-    user_type_id: Optional[int] = None
-    subject_id: Optional[int] = None
-    password_hash: Optional[str] = None
-
-
-class UserUpdate(BaseModel):
-    name: Optional[str] = None
-    student_code: Optional[str] = None
-    role: Optional[str] = None
-    subject_id: Optional[int] = None
 
 
 @app.post("/users")
@@ -816,9 +772,7 @@ def delete_face(face_id: int, db: Session = Depends(get_db)):
 
 
 # --- 8. Faculty Dashboard Endpoints ---
-
-# [ ⭐️ ย้ายมาไว้ตรงนี้ ⭐️ ]
-# Pydantic Models to match React's 'page.tsx' interfaces
+# (Pydantic Models for Faculty Dashboard)
 class ISubjectResponse(BaseModel):
     id: str
     name: str
@@ -887,7 +841,7 @@ class IArrivalHistogram(BaseModel):
 class ILiveDataEntry(BaseModel):
     studentId: str
     name: str
-    status: str  # "Present" | "Late" | "Absent"
+    status: str
     checkIn: Optional[str] = None
     checkOut: Optional[str] = None
     duration: Optional[str] = None
@@ -900,17 +854,10 @@ class ISessionViewData(BaseModel):
     liveDataTable: List[ILiveDataEntry]
 
 
-# --- [ ⭐️ สิ้นสุดส่วนที่ย้าย ⭐️ ] ---
-
-
 @app.get("/api/faculty/subjects", response_model=List[ISubjectResponse])
 def get_faculty_subjects(db: Session = Depends(get_db)):
-    """
-    [เหมือนเดิม] ดึงข้อมูลวิชาจาก DB จริง (รวม order_by)
-    """
     try:
-        subjects = db.query(Subject).filter(Subject.is_deleted == 0).order_by(Subject.academic_year.desc(),
-                                                                              Subject.subject_name).all()
+        subjects = db.query(Subject).order_by(Subject.academic_year.desc(), Subject.subject_name).all()
         results = []
         for s in subjects:
             name = f"[{s.academic_year or 'N/A'}] {s.subject_name}"
@@ -929,9 +876,6 @@ def get_faculty_subjects(db: Session = Depends(get_db)):
 
 @app.get("/api/faculty/semester-overview", response_model=ISemesterOverviewData)
 def get_semester_overview(subjectId: str, db: Session = Depends(get_db)):
-    """
-    [เหมือนเดิม] คำนวณภาพรวมเทอมจาก Database จริง
-    """
     try:
         subject_id_int = int(subjectId)
     except ValueError:
@@ -1111,6 +1055,7 @@ def get_session_view(subjectId: str, date: date, db: Session = Depends(get_db)):
 
     return ISessionViewData(kpis=kpis, summaryDonut=summary_donut, arrivalHistogram=arrival_histogram,
                             liveDataTable=live_data_table)
+
 
 # --- 9. Uvicorn Runner ---
 if __name__ == "__main__":

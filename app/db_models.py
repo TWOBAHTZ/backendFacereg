@@ -1,7 +1,6 @@
-# app/db_models.py
 from __future__ import annotations
 
-from datetime import datetime, time as dt_time # 👈 [1. แก้ไข] เพิ่ม import time
+from datetime import datetime, time as dt_time
 from typing import Generator, List, Optional
 
 from sqlalchemy import (
@@ -14,7 +13,7 @@ from sqlalchemy import (
     String,
     UniqueConstraint,
     create_engine,
-    Time, # 👈 [2. แก้ไข] เพิ่ม import Time
+    Time,
 )
 from sqlalchemy.orm import (
     DeclarativeBase,
@@ -39,6 +38,7 @@ engine = create_engine(
     future=True,
     pool_pre_ping=True,
 )
+
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 
 
@@ -53,28 +53,34 @@ class UserType(Base):
 class Subject(Base):
     __tablename__ = "subjects"
     __table_args__ = (
-        UniqueConstraint("subject_name", "section", "academic_year", name="uq_subject"),
+        # ✨ [แก้ไข] อัปเดต Constraint ให้ตรงกับคอลัมน์ที่มี
+        UniqueConstraint("subject_name", "section", "academic_year", name="uq_subject_instance"),
     )
 
     subject_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     subject_name: Mapped[str] = mapped_column(String(255), nullable=False)
-    section: Mapped[Optional[str]] = mapped_column(String(100), default=None)
-    schedule: Mapped[Optional[str]] = mapped_column(String(255), default=None)
-    cover_image_path: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
-    is_deleted: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    academic_year: Mapped[Optional[str]] = mapped_column(String(20), default=None)
+    section: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    schedule: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
 
-    # --- [3. แก้ไข] เพิ่ม 2 บรรทัดนี้ ---
-    class_start_time: Mapped[Optional[dt_time]] = mapped_column(Time) # เช่น 09:00:00
-    class_end_time: Mapped[Optional[dt_time]] = mapped_column(Time)   # เช่น 12:00:00
-    # ---
+    # ✨ [แก้ไข] อัปเดตคอลัมน์ให้ตรงกับ DB (varchar(20))
+    academic_year: Mapped[Optional[str]] = mapped_column(String(20))
 
+    class_start_time: Mapped[Optional[dt_time]] = mapped_column(Time, nullable=True)
+    class_end_time: Mapped[Optional[dt_time]] = mapped_column(Time, nullable=True)
+
+    # (ลบ cover_image_path และ is_deleted ที่ไม่มีใน DB ออก)
+
+    # relationships
     users: Mapped[List["User"]] = relationship(back_populates="subject")
     logs: Mapped[List["AttendanceLog"]] = relationship(back_populates="subject")
+
+    def __repr__(self) -> str:
+        return f"<Subject {self.subject_id}:{self.subject_name} ({self.academic_year})>"
 
 
 class User(Base):
     __tablename__ = "users"
+    # (โค้ดเหมือนเดิม)
     user_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     student_code: Mapped[Optional[str]] = mapped_column(String(50), index=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
