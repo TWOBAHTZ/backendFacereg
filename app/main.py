@@ -1112,7 +1112,6 @@ def get_session_view(subjectId: str, date: date, db: Session = Depends(get_db)):
     return ISessionViewData(kpis=kpis, summaryDonut=summary_donut, arrivalHistogram=arrival_histogram,
                             liveDataTable=live_data_table)
 
-
 # --- 9. Uvicorn Runner ---
 if __name__ == "__main__":
     import uvicorn
